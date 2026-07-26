@@ -5,12 +5,15 @@ Auth is per-user (email + password, pbkdf2). Roles: admin / internal / customer
 views; the billing run and admin console are Macgear-internal. The /admin/ingest and
 /admin/billing/* endpoints are token-authed for n8n (the app never calls NetSuite itself).
 """
+import csv
+import io
 import json
 import os
 from datetime import date, datetime, timedelta
 
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
+                               StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
@@ -295,6 +298,140 @@ def home(request: Request, db: Session = Depends(get_db)):
     return RedirectResponse(f"/c/{own.slug}/{first}", status_code=303)
 
 
+# Views that grow without bound, so they're date-windowed + paged rather than rendering all
+# of history. Stock on hand / stock on order are naturally small (latest snapshot, open POs).
+PAGED_VIEWS = ("item_receipts", "fulfilments", "invoices")
+
+
+def _paged(db: Session, cust: Customer, view: str, imap: dict, qp) -> dict:
+    """Shared window/search/page handling for the three unbounded list views.
+
+    A search deliberately drops the date window and runs over all history: a filter that only
+    covered the visible window would report "not found" for a document that exists, which is
+    not acceptable on views people reconcile invoices against.
+    """
+    window = qp.get("window") or service.DEFAULT_WINDOW
+    if window not in service.LIST_WINDOWS:
+        window = service.DEFAULT_WINDOW
+    q = (qp.get("q") or "").strip()
+    try:
+        shown = max(service.PAGE_SIZE, int(qp.get("n") or service.PAGE_SIZE))
+    except ValueError:
+        shown = service.PAGE_SIZE
+    shown = min(shown, 10_000)                      # hard ceiling on one response
+    since = None if q else service.window_since(window)
+
+    names = service.item_names(db, cust.id)
+    if view == "item_receipts":
+        res = service.item_receipts(db, cust.id, imap, names, since=since, q=q or None,
+                                   limit=shown)
+    elif view == "fulfilments":
+        res = service.fulfilments(db, cust.id, imap, names, since=since, q=q or None,
+                                  limit=shown)
+    else:
+        res = service.invoices(db, cust.id, since=since, q=q or None, limit=shown)
+    return {"rows": res["rows"], "total": res["total"], "qty_total": res["qty_total"],
+            "docs": res["docs"], "window": window, "q": q, "shown": shown,
+            "since": since, "next_n": shown + service.PAGE_SIZE,
+            "has_more": res["total"] > len(res["rows"]), "paged": True}
+
+
+@app.get("/c/{slug}/{view}/rows", response_class=HTMLResponse)
+def portal_rows(slug: str, view: str, request: Request, db: Session = Depends(get_db)):
+    """Just the <tr> rows for a paged view — what the Load more button fetches and appends.
+    Same permission checks as the full page; renders the same macros, so there's one copy of
+    the row markup."""
+    user = cur(request)
+    cust = _get_customer(db, slug)
+    if not cust or view not in PAGED_VIEWS:
+        return HTMLResponse("", status_code=404)
+    if not perms.is_internal(user) and cust.id != user.customer_id:
+        return HTMLResponse("", status_code=403)
+    if view not in perms.effective_views(user):
+        return HTMLResponse("", status_code=403)
+    imap = service.item_map(db, cust.id)
+    ctx = _paged(db, cust, view, imap, request.query_params)
+    # only the newly-revealed tail, so the client appends instead of re-rendering
+    try:
+        have = max(0, int(request.query_params.get("have") or 0))
+    except ValueError:
+        have = 0
+    ctx["rows"] = ctx["rows"][have:]
+    ctx.update(view=view, customer=cust)
+    return templates.TemplateResponse(request, "_rows_partial.html", ctx)
+
+
+@app.get("/c/{slug}/{view}/export.csv")
+def portal_export(slug: str, view: str, request: Request, db: Session = Depends(get_db)):
+    """CSV of the ENTIRE current selection, not just the loaded page — these views get
+    reconciled against invoices, so a partial export would be worse than none."""
+    user = cur(request)
+    cust = _get_customer(db, slug)
+    if not cust or view not in PAGED_VIEWS:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if not perms.is_internal(user) and cust.id != user.customer_id:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    if view not in perms.effective_views(user):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    cols = {
+        "item_receipts": [("Receipt", "tranid"), ("PO", "po"), ("Inbound shipment", "shipment"),
+                          ("SKU", "sku"), ("Description", "name"), ("Qty", "qty"),
+                          ("Date", "trandate")],
+        "fulfilments": [("Fulfilment", "tranid"), ("Type", "source"), ("Source", "ref"),
+                        ("SKU", "sku"), ("Qty", "qty"), ("Date", "trandate")],
+        "invoices": [("Invoice", "tranid"), ("Date", "trandate"), ("Amount", "total"),
+                     ("Status", "status")],
+    }[view]
+    window = request.query_params.get("window") or service.DEFAULT_WINDOW
+    if window not in service.LIST_WINDOWS:
+        window = service.DEFAULT_WINDOW
+    q = (request.query_params.get("q") or "").strip() or None
+    since = None if q else service.window_since(window)
+    imap = service.item_map(db, cust.id)
+    names = service.item_names(db, cust.id)
+    fetch = {"item_receipts": service.item_receipts,
+             "fulfilments": service.fulfilments}.get(view)
+
+    def cell(v):
+        if v is None:
+            return ""
+        if isinstance(v, float) and v.is_integer():
+            return int(v)            # 700 rather than 700.0 — this lands in Excel
+        return v
+
+    def stream():
+        """Paged in CHUNKS rather than one capped fetch: the toolbar promises the whole
+        selection, so a silent truncation at some row limit would be worse than a slow
+        download (people reconcile invoices off this file)."""
+        buf = io.StringIO()
+        w = csv.writer(buf, lineterminator="\r\n")
+        w.writerow([h for h, _ in cols])
+        yield "﻿" + buf.getvalue()                  # BOM so Excel reads UTF-8
+        offset, CHUNK = 0, 1000
+        while True:
+            if fetch:
+                res = fetch(db, cust.id, imap, names, since=since, q=q,
+                            limit=CHUNK, offset=offset)
+            else:
+                res = service.invoices(db, cust.id, since=since, q=q,
+                                       limit=CHUNK, offset=offset)
+            rows = res["rows"]
+            if not rows:
+                return
+            buf.seek(0); buf.truncate(0)
+            for r in rows:
+                w.writerow([cell(r.get(k)) for _, k in cols])
+            yield buf.getvalue()
+            offset += len(rows)
+            if offset >= res["total"]:
+                return
+
+    name = f"{cust.slug}-{view.replace('_', '-')}-{date.today().isoformat()}.csv"
+    return StreamingResponse(stream(), media_type="text/csv; charset=utf-8",
+                             headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
 @app.get("/c/{slug}/{view}", response_class=HTMLResponse)
 def portal(slug: str, view: str, request: Request, db: Session = Depends(get_db)):
     user = cur(request)
@@ -316,15 +453,11 @@ def portal(slug: str, view: str, request: Request, db: Session = Depends(get_db)
         ctx["data"] = service.overview(db, cust, imap)
     elif view == "stock_on_order":
         ctx["rows"] = service.stock_on_order(db, cust.id, imap, service.item_names(db, cust.id))
-    elif view == "item_receipts":
-        ctx["rows"] = service.item_receipts(db, cust.id, imap, service.item_names(db, cust.id))
+    elif view in PAGED_VIEWS:
+        ctx.update(_paged(db, cust, view, imap, request.query_params))
     elif view == "stock_on_hand":
         ctx["rows"] = service.stock_on_hand(db, cust.id, imap, service.item_names(db, cust.id))
         ctx["soh_synced_at"] = service.soh_synced_at(db, cust.id)
-    elif view == "fulfilments":
-        ctx["rows"] = service.fulfilments(db, cust.id, imap)
-    elif view == "invoices":
-        ctx["rows"] = service.invoices(db, cust.id)
     elif view == "rate_card":
         ctx["rows"] = service.rate_card_lines(db, cust.id)
     elif view == "billing":

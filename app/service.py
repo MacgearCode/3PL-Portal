@@ -9,12 +9,21 @@ forward-looking and has to agree with the calendar).
 import math
 from datetime import date, timedelta
 
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import Session, selectinload
 
 from .billing import active_rate_card, compute_billing
-from .models import (Customer, InboundShipment, Item, ItemFulfilment, ItemReceipt,
-                     Invoice, InvoiceLine, PurchaseOrder, StockOnHand)
+from .models import (Customer, InboundShipment, Item, ItemFulfilment, ItemFulfilmentLine,
+                     ItemReceipt, ItemReceiptLine, Invoice, InvoiceLine, PurchaseOrder,
+                     StockOnHand)
+
+# Line collections default to lazy="select", so "for r in rows: for l in r.lines" fires one
+# query per parent row. At two years of Mova's cadence that was 937 queries / 425 ms for the
+# receipts view and 1,514 / 582 ms for the overview. selectinload() collapses each of those to
+# one extra query. It matters far more on the droplet than it looks locally: SQLite is
+# in-process, but Postgres pays a network round trip per query.
+_RECEIPT_LINES = selectinload(ItemReceipt.lines)
+_FULFILMENT_LINES = selectinload(ItemFulfilment.lines)
 
 
 def item_map(db: Session, customer_id: int) -> dict[str, str]:
@@ -44,6 +53,7 @@ def stock_on_order(db: Session, customer_id: int, imap: dict,
     pos = db.scalars(
         select(PurchaseOrder).where(PurchaseOrder.customer_id == customer_id,
                                     PurchaseOrder.status != "closed")
+        .options(selectinload(PurchaseOrder.lines))
         .order_by(PurchaseOrder.trandate.desc())).all()
     # A PO line that's been added to an inbound shipment (container) gets the shipment's
     # doc number + its (authoritative) expected-receipt date and status surfaced here.
@@ -72,20 +82,90 @@ def stock_on_order(db: Session, customer_id: int, imap: dict,
     return out
 
 
-def item_receipts(db: Session, customer_id: int, imap: dict,
-                  names: dict | None = None) -> list[dict]:
+# --- list-view windowing / paging / search ------------------------------------
+# Receipts, fulfilments and invoices grow without bound (Mova alone: ~470 receipts a year), so
+# these views are windowed by date and paged rather than rendering all of history. Search
+# deliberately ignores the window and runs over the whole history in SQL — a filter that
+# silently only covered the visible page would report "not found" for a document that exists,
+# which is unacceptable on a billing-adjacent view.
+LIST_WINDOWS = ("14", "30", "90", "period", "all")
+DEFAULT_WINDOW = "30"
+PAGE_SIZE = 100
+
+
+def window_since(window: str, today: date | None = None) -> date | None:
+    """First date a list-view window includes. None = all history."""
+    today = today or date.today()
+    if window == "all":
+        return None
+    if window == "period":
+        return week_bounds(today)[0]
+    days = {"14": 14, "30": 30, "90": 90}.get(window, 30)
+    return today - timedelta(days=days - 1)
+
+
+def _text_match(q: str, item_col, doc_cols, imap: dict, names: dict):
+    """OR-match q across document columns plus any item whose SKU/description contains it.
+
+    imap/names are already loaded once per request, so resolving SKU text in Python keeps this
+    to a single `ns_item_id IN (...)` term instead of another join.
+    """
+    like = f"%{q.lower()}%"
+    ql = q.lower()
+    ns_ids = {ns for ns, v in imap.items() if v and ql in str(v).lower()}
+    ns_ids |= {ns for ns, v in names.items() if v and ql in str(v).lower()}
+    ors = [func.lower(c).like(like) for c in doc_cols]
+    if ns_ids:
+        ors.append(item_col.in_(sorted(ns_ids)))
+    return or_(*ors)
+
+
+def item_receipts(db: Session, customer_id: int, imap: dict, names: dict | None = None,
+                  *, since: date | None = None, q: str | None = None,
+                  limit: int | None = None, offset: int = 0) -> dict:
+    """Receipt LINES, newest first.
+
+    Returns {rows, total, qty_total, docs} where total/qty_total/docs describe the WHOLE
+    matching set, not the page — a footer that silently summed only the loaded rows would
+    misreport against the putaway charge.
+
+    Two queries regardless of volume (lines joined to their receipt); it used to be one query
+    per receipt — 937 at two years of Mova's cadence.
+    """
     names = names or {}
-    recs = db.scalars(
-        select(ItemReceipt).where(ItemReceipt.customer_id == customer_id)
-        .order_by(ItemReceipt.trandate.desc())).all()
-    out = []
-    for r in recs:
-        for l in r.lines:
-            out.append({"tranid": r.tranid, "trandate": r.trandate,
-                        "shipment": r.ns_inbound_shipment, "po": r.po_tranid,
-                        "sku": imap.get(l.ns_item_id, l.ns_item_id),
-                        "name": names.get(l.ns_item_id, ""), "qty": float(l.qty)})
-    return out
+    conds = [ItemReceipt.customer_id == customer_id]
+    if since is not None:
+        conds.append(ItemReceipt.trandate >= since)
+    if q:
+        conds.append(_text_match(
+            q, ItemReceiptLine.ns_item_id,
+            [ItemReceipt.tranid, ItemReceipt.po_tranid, ItemReceipt.ns_inbound_shipment],
+            imap, names))
+    join = (ItemReceiptLine.__table__
+            .join(ItemReceipt.__table__, ItemReceiptLine.item_receipt_id == ItemReceipt.id))
+    agg = db.execute(
+        select(func.count(), func.coalesce(func.sum(ItemReceiptLine.qty), 0),
+               func.count(func.distinct(ItemReceipt.id)))
+        .select_from(join).where(*conds)).one()
+    stmt = (select(ItemReceiptLine, ItemReceipt)
+            .join(ItemReceipt, ItemReceiptLine.item_receipt_id == ItemReceipt.id)
+            .where(*conds)
+            .order_by(ItemReceipt.trandate.desc(), ItemReceipt.id.desc(), ItemReceiptLine.id))
+    if limit is not None:
+        stmt = stmt.limit(limit).offset(offset)
+    rows = [{"tranid": r.tranid, "trandate": r.trandate,
+             "shipment": r.ns_inbound_shipment, "po": r.po_tranid,
+             "sku": imap.get(l.ns_item_id, l.ns_item_id),
+             "name": names.get(l.ns_item_id, ""), "qty": float(l.qty)}
+            for l, r in db.execute(stmt).all()]
+    return {"rows": rows, "total": agg[0] or 0, "qty_total": float(agg[1] or 0),
+            "docs": agg[2] or 0}
+
+
+def recent_receipts(db: Session, customer_id: int, imap: dict, limit: int) -> list[dict]:
+    """The N newest receipt lines — for the overview's Recent activity panel, which used to
+    load every receipt in history and then slice the first two off the front."""
+    return item_receipts(db, customer_id, imap, limit=limit)["rows"]
 
 
 def stock_on_hand(db: Session, customer_id: int, imap: dict,
@@ -134,25 +214,69 @@ def soh_synced_at(db: Session, customer_id: int):
             StockOnHand.snapshot_date == latest)) or latest
 
 
-def fulfilments(db: Session, customer_id: int, imap: dict) -> list[dict]:
-    fs = db.scalars(
-        select(ItemFulfilment).where(ItemFulfilment.customer_id == customer_id)
-        .order_by(ItemFulfilment.trandate.desc())).all()
-    out = []
-    for f in fs:
-        for l in f.lines:
-            out.append({"tranid": f.tranid, "trandate": f.trandate,
-                        "source": f.source_type, "ref": f.ns_source_id,
-                        "sku": imap.get(l.ns_item_id, l.ns_item_id), "qty": float(l.qty)})
-    return out
+def fulfilments(db: Session, customer_id: int, imap: dict, names: dict | None = None,
+                *, since: date | None = None, q: str | None = None,
+                limit: int | None = None, offset: int = 0) -> dict:
+    """Fulfilment LINES, newest first. Same shape and 2-query cost as item_receipts()."""
+    names = names or {}
+    conds = [ItemFulfilment.customer_id == customer_id]
+    if since is not None:
+        conds.append(ItemFulfilment.trandate >= since)
+    if q:
+        conds.append(_text_match(
+            q, ItemFulfilmentLine.ns_item_id,
+            [ItemFulfilment.tranid, ItemFulfilment.ns_source_id, ItemFulfilment.source_type],
+            imap, names))
+    join = (ItemFulfilmentLine.__table__
+            .join(ItemFulfilment.__table__,
+                  ItemFulfilmentLine.item_fulfilment_id == ItemFulfilment.id))
+    agg = db.execute(
+        select(func.count(), func.coalesce(func.sum(ItemFulfilmentLine.qty), 0),
+               func.count(func.distinct(ItemFulfilment.id)))
+        .select_from(join).where(*conds)).one()
+    stmt = (select(ItemFulfilmentLine, ItemFulfilment)
+            .join(ItemFulfilment, ItemFulfilmentLine.item_fulfilment_id == ItemFulfilment.id)
+            .where(*conds)
+            .order_by(ItemFulfilment.trandate.desc(), ItemFulfilment.id.desc(),
+                      ItemFulfilmentLine.id))
+    if limit is not None:
+        stmt = stmt.limit(limit).offset(offset)
+    rows = [{"tranid": f.tranid, "trandate": f.trandate,
+             "source": f.source_type, "ref": f.ns_source_id,
+             "sku": imap.get(l.ns_item_id, l.ns_item_id), "qty": float(l.qty)}
+            for l, f in db.execute(stmt).all()]
+    return {"rows": rows, "total": agg[0] or 0, "qty_total": float(agg[1] or 0),
+            "docs": agg[2] or 0}
 
 
-def invoices(db: Session, customer_id: int) -> list[dict]:
-    rows = db.scalars(
-        select(Invoice).where(Invoice.customer_id == customer_id)
-        .order_by(Invoice.trandate.desc())).all()
-    return [{"id": i.id, "tranid": i.tranid, "trandate": i.trandate, "status": i.status,
-             "total": float(i.total) if i.total is not None else None} for i in rows]
+def recent_fulfilments(db: Session, customer_id: int, imap: dict, limit: int) -> list[dict]:
+    """The N newest fulfilment lines — see recent_receipts()."""
+    return fulfilments(db, customer_id, imap, limit=limit)["rows"]
+
+
+def invoices(db: Session, customer_id: int, *, since: date | None = None,
+             q: str | None = None, limit: int | None = None, offset: int = 0) -> dict:
+    """Invoice headers, newest first. qty_total is the summed invoice amount."""
+    conds = [Invoice.customer_id == customer_id]
+    if since is not None:
+        conds.append(Invoice.trandate >= since)
+    if q:
+        like = f"%{q.lower()}%"
+        conds.append(or_(func.lower(Invoice.tranid).like(like),
+                         func.lower(Invoice.status).like(like)))
+    agg = db.execute(
+        select(func.count(), func.coalesce(func.sum(Invoice.total), 0))
+        .select_from(Invoice.__table__).where(*conds)).one()
+    stmt = (select(Invoice).where(*conds)
+            .order_by(Invoice.trandate.desc(), Invoice.id.desc()))
+    if limit is not None:
+        stmt = stmt.limit(limit).offset(offset)
+    rows = db.scalars(stmt).all()
+    return {"rows": [{"id": i.id, "tranid": i.tranid, "trandate": i.trandate,
+                      "status": i.status,
+                      "total": float(i.total) if i.total is not None else None}
+                     for i in rows],
+            "total": agg[0] or 0, "qty_total": float(agg[1] or 0), "docs": agg[0] or 0}
 
 
 def invoice_with_lines(db: Session, customer_id: int, invoice_id: int):
@@ -216,16 +340,19 @@ def week_bounds(d: date) -> tuple[date, date]:
 
 def received_per_week(db: Session, customer_id: int, weeks: list[tuple[date, date]]) -> list[dict]:
     """Item-receipt units per week — the same count billing charges putaway on
-    (billing.py), but as a series instead of a single period."""
+    (billing.py), but as a series instead of a single period.
+
+    Summed in SQL: one query per week rather than one per week plus one per receipt.
+    """
     out = []
     for s, e in weeks:
-        recs = db.scalars(
-            select(ItemReceipt).where(
-                ItemReceipt.customer_id == customer_id,
-                ItemReceipt.trandate >= s,
-                ItemReceipt.trandate <= e)).all()
-        out.append({"label": s.strftime("%d %b"),
-                    "total": sum(float(l.qty) for r in recs for l in r.lines)})
+        total = db.scalar(
+            select(func.coalesce(func.sum(ItemReceiptLine.qty), 0))
+            .select_from(ItemReceiptLine.__table__.join(
+                ItemReceipt.__table__, ItemReceiptLine.item_receipt_id == ItemReceipt.id))
+            .where(ItemReceipt.customer_id == customer_id,
+                   ItemReceipt.trandate >= s, ItemReceipt.trandate <= e))
+        out.append({"label": s.strftime("%d %b"), "total": float(total or 0)})
     return out
 
 
@@ -283,8 +410,10 @@ def overview(db: Session, customer: Customer, imap: dict) -> dict:
     received = received_per_week(db, customer.id, past_weeks)
     incoming, incoming_rest = incoming_per_week(soo, next_weeks)
 
-    recent = (item_receipts(db, customer.id, imap)[:2] +
-              fulfilments(db, customer.id, imap)[:3])
+    # LIMIT in SQL, not slice-after-loading-everything: this pair used to pull every receipt
+    # and fulfilment in history to show five rows.
+    recent = (recent_receipts(db, customer.id, imap, 2) +
+              recent_fulfilments(db, customer.id, imap, 3))
     for r in recent:
         r["kind"] = "Receipt" if "shipment" in r else "Fulfilment"
     recent.sort(key=lambda r: r["trandate"] or date.min, reverse=True)

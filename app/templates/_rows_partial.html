@@ -1,0 +1,8 @@
+{#- What GET /c/{slug}/{view}/rows returns: bare <tr> elements for the Load more button to
+    append. Dispatches to the same macros portal.html uses, so there is one copy of the row
+    markup. No wrapper element and no stray whitespace — this is injected into a <tbody>. -#}
+{%- import "_rows.html" as R with context -%}
+{%- if view == 'item_receipts' -%}{{ R.receipt_rows(rows) }}
+{%- elif view == 'fulfilments' -%}{{ R.fulfilment_rows(rows) }}
+{%- elif view == 'invoices' -%}{{ R.invoice_rows(rows, customer) }}
+{%- endif -%}

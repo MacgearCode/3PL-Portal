@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import date
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from .models import (Customer, InboundShipment, ItemFulfilment, ItemFulfilmentLine,
                      ItemReceipt, ItemReceiptLine, RateCard, RateCardLine, StockOnHand)
@@ -98,11 +98,14 @@ def compute_billing(db: Session, customer: Customer,
         [s.shipment_number or s.ns_shipment_id for s in shipments])
 
     # --- putaway: item-receipt units in period --------------------------------
+    # selectinload: the line walk below is otherwise one query per receipt, and the overview
+    # runs compute_billing five times per page load. Loading strategy only — same arithmetic.
     receipts = db.scalars(
         select(ItemReceipt).where(
             ItemReceipt.customer_id == customer.id,
             ItemReceipt.trandate >= period_start,
-            ItemReceipt.trandate <= period_end)).all()
+            ItemReceipt.trandate <= period_end)
+        .options(selectinload(ItemReceipt.lines))).all()
     putaway_units = sum(float(l.qty) for r in receipts for l in r.lines)
     add("putaway", putaway_units, [r.tranid or r.ns_receipt_id for r in receipts])
 
@@ -143,7 +146,8 @@ def compute_billing(db: Session, customer: Customer,
                 ItemFulfilment.customer_id == customer.id,
                 ItemFulfilment.source_type == source,
                 ItemFulfilment.trandate >= period_start,
-                ItemFulfilment.trandate <= period_end)).all()
+                ItemFulfilment.trandate <= period_end)
+            .options(selectinload(ItemFulfilment.lines))).all()
         units = sum(max(0.0, float(l.qty)) for f in fulfils for l in f.lines)
         add(charge_type, units, [f.tranid or f.ns_fulfilment_id for f in fulfils])
 

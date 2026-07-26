@@ -29,6 +29,28 @@ with OS-preference fallback. The sidebar and admin header are now **white in lig
 hardcoded dark teal in both). `prototype/portal.html` was deliberately **not** re-themed — it's still teal.
 Responsive: off-canvas nav drawer ≤860px; chart's segmented control drops to its own line ≤560px.
 
+**Paged list views (2026-07-27)** — Item receipts / Fulfilments / Invoices grow without bound
+(~470 receipts a year for Mova alone), so they're **date-windowed + paged**: default **last 30
+days**, selector `14d / 30d / 90d / This period / All`, **Load more** appends the next 100 rows via
+`GET /c/{slug}/{view}/rows` (fetch + append; the button is a real link with a bigger `n=`, so it
+degrades to a full page load without JS). Stock on hand / Stock on order are naturally bounded
+(latest snapshot, open POs) and left alone.
+Three things are deliberately **server-side, covering ALL history, not the rendered page** — a
+partial answer on views people reconcile invoices against is worse than a slow one:
+- **Search** (`?q=`) runs in SQL and *ignores the date window* (the UI says "across all history").
+  The old client-side `filterTable()` now only serves the small views, where every row is present.
+- **Footer totals** come from SQL aggregates (`total` / `qty_total` / `docs`), not `rows|sum`.
+- **Export CSV** streams the whole selection in 1,000-row chunks — no row cap to truncate at.
+
+**Query performance** — line collections are `lazy="select"`, so `for r in rows: for l in r.lines`
+was an N+1. Measured at 2 years of Mova's cadence (936 receipts / 1,872 lines): receipts view
+937 queries / 425 ms → **2 queries / 8 ms**, overview 1,514 / 582 ms → **67 / 40 ms**, HTML
+531 KB → 38 KB. Fixes: paged views query lines joined to their parent; `selectinload()` in
+`billing.py` (called 5× per overview) and `stock_on_order()`; `received_per_week()` sums in SQL;
+`overview()` uses `recent_receipts/recent_fulfilments` with a real `LIMIT` instead of loading all
+history and slicing `[:2]`/`[:3]`. **This matters more in prod than the numbers suggest** — those
+were SQLite (in-process); Postgres pays a network round trip per query.
+
 **Overview chart** — one card, three selectable series (segmented pills, default = Billing, choice
 remembered in localStorage): *Received* (units received per week, last 4), *Incoming* (outstanding
 on-order units bucketed by expected arrival, next 4 — forecast bars are visually distinct; anything that

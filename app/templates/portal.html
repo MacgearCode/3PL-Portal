@@ -1,6 +1,9 @@
 {% extends "base.html" %}
+{% import "_rows.html" as R with context %}
 {% block title %}{{ title }} — {{ customer.name }} — Macgear 3PL{% endblock %}
-{# Filter box + CSV export for a data table. tid = the <table> id; csv = download filename stem. #}
+{# Client-side filter + CSV export, for the SMALL views only (stock on hand / on order), where
+   every row is already on the page so filtering and exporting the DOM is honest.
+   The paged views use pagedtools() below instead. #}
 {% macro tabletools(tid, csv) %}
 <div class="ttools">
   <div class="tsearch">
@@ -12,6 +15,53 @@
     Export CSV
   </button>
 </div>
+{% endmacro %}
+
+{# Toolbar for the paged views. Window + search are GET params handled server-side, so the
+   search covers ALL history (not just what's rendered) and the CSV exports the whole current
+   selection. Both are plain forms/links — they work with JS disabled. #}
+{# `one` is the singular noun; plural is one + 's', which suits all three views. #}
+{% macro pagedtools(one) %}
+{% set noun = one if total == 1 else one ~ 's' %}
+<div class="ttools">
+  <form class="tsearch" method="get" action="">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="1.8"/><path d="m20 20-3.5-3.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+    <input type="search" name="q" value="{{ q }}" placeholder="Search all {{ noun }}…" aria-label="Search {{ noun }}">
+    <input type="hidden" name="window" value="{{ window }}">
+    {% if q %}<a class="qclear" href="?window={{ window }}" title="Clear search">✕</a>{% endif %}
+  </form>
+  <div class="winsel">
+    {% for key, label in [('14','14d'), ('30','30d'), ('90','90d'), ('period','This period'), ('all','All')] %}
+    <a href="?window={{ key }}{% if q %}&q={{ q|urlencode }}{% endif %}"
+       class="{{ 'on' if window == key }}">{{ label }}</a>
+    {% endfor %}
+  </div>
+  <a class="btn-export" href="export.csv?window={{ window }}{% if q %}&q={{ q|urlencode }}{% endif %}"
+     title="Download the whole current selection ({{ total }} rows), not just what's on screen">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v2a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    Export CSV
+  </a>
+</div>
+<div class="pagebar">
+  {%- if q %}Found <b>{{ total|qty }}</b> matching {{ noun }} across <b>all history</b>
+  {%- else %}<b>{{ total|qty }}</b> {{ noun }}
+    {%- if window != 'all' %} in the {{ {'14':'last 14 days','30':'last 30 days','90':'last 90 days','period':'current billing period'}[window] }}{% endif %}
+  {%- endif %}
+  {%- if has_more %} · showing {{ rows|length }}{% endif %}
+</div>
+{% endmacro %}
+
+{# "Load more" — fetches the next page of <tr>s and appends. The href is a real link with a
+   bigger n=, so with JS off (or if the fetch fails) it just loads a fuller page. #}
+{% macro loadmore(tid) %}
+{% if has_more %}
+<div class="loadmore">
+  <a class="btn-more" href="?window={{ window }}{% if q %}&q={{ q|urlencode }}{% endif %}&n={{ next_n }}"
+     data-tbl="{{ tid }}" data-have="{{ rows|length }}" data-total="{{ total }}"
+     onclick="return loadMore(this)">Load {{ [total - rows|length, 100]|min }} more</a>
+  <span class="note">{{ rows|length|qty }} of {{ total|qty }} shown</span>
+</div>
+{% endif %}
 {% endmacro %}
 {% block body %}
 <div class="app">
@@ -187,14 +237,15 @@
 
     {% elif view == "item_receipts" %}
       <div class="card"><header><h3>Item receipts</h3><span class="hint">against 3PL location · brand {{ customer.brand_label }}</span></header>
-        {{ tabletools('tbl-rcpt', customer.slug ~ '-item-receipts') }}
+        {{ pagedtools('receipt line') }}
         <div class="tablewrap"><table id="tbl-rcpt">
           <thead><tr><th>Receipt</th><th>PO</th><th>Inbound shipment</th><th>SKU</th><th>Description</th><th class="r">Qty</th><th>Date</th></tr></thead>
-          <tbody>{% for r in rows %}<tr><td><span class="id">{{ r.tranid }}</span></td><td><span class="id">{{ r.po or '—' }}</span></td><td><span class="id">{{ r.shipment or '—' }}</span></td>
-            <td><span class="id">{{ r.sku }}</span></td><td class="prim">{{ r.name }}</td><td class="r num">{{ r.qty|qty }}</td><td>{{ r.trandate|dshort }}</td></tr>
-          {% else %}<tr><td class="empty" colspan="7">No item receipts.</td></tr>{% endfor %}</tbody>
-          {% if rows %}<tfoot><tr><td colspan="5">{{ rows|length }} receipts</td><td class="r">{{ rows|sum(attribute='qty')|qty }}</td><td></td></tr></tfoot>{% endif %}
+          <tbody>{{ R.receipt_rows(rows) }}
+          {% if not rows %}<tr><td class="empty" colspan="7">{{ 'No receipts match that search.' if q else 'No item receipts in this period.' }}</td></tr>{% endif %}</tbody>
+          {# totals are the WHOLE selection from SQL, not just the loaded rows #}
+          {% if rows %}<tfoot><tr><td colspan="5">{{ docs|qty }} receipts · {{ total|qty }} lines</td><td class="r">{{ qty_total|qty }}</td><td></td></tr></tfoot>{% endif %}
         </table></div>
+        {{ loadmore('tbl-rcpt') }}
       </div>
 
     {% elif view == "stock_on_hand" %}
@@ -213,15 +264,14 @@
 
     {% elif view == "fulfilments" %}
       <div class="card"><header><h3>Fulfilments</h3><span class="hint">sales orders + VRMA transfers · drives per-unit pick fee</span></header>
-        {{ tabletools('tbl-ful', customer.slug ~ '-fulfilments') }}
+        {{ pagedtools('fulfilment line') }}
         <div class="tablewrap"><table id="tbl-ful">
           <thead><tr><th>Fulfilment</th><th>Type</th><th>Source</th><th>Item</th><th class="r">Qty</th><th>Date</th></tr></thead>
-          <tbody>{% for r in rows %}<tr><td><span class="id">{{ r.tranid }}</span></td>
-            <td>{% if r.source == 'VRMA' %}<span class="tag vrma">VRMA</span>{% else %}<span class="tag so">SO</span>{% endif %}</td>
-            <td><span class="id">{{ r.ref or '—' }}</span></td><td class="prim">{{ r.sku }}</td><td class="r num">{{ r.qty|qty }}</td><td>{{ r.trandate|dshort }}</td></tr>
-          {% else %}<tr><td class="empty" colspan="6">No fulfilments.</td></tr>{% endfor %}</tbody>
-          {% if rows %}<tfoot><tr><td colspan="4">{{ rows|length }} fulfilments</td><td class="r">{{ rows|sum(attribute='qty')|qty }}</td><td></td></tr></tfoot>{% endif %}
+          <tbody>{{ R.fulfilment_rows(rows) }}
+          {% if not rows %}<tr><td class="empty" colspan="6">{{ 'No fulfilments match that search.' if q else 'No fulfilments in this period.' }}</td></tr>{% endif %}</tbody>
+          {% if rows %}<tfoot><tr><td colspan="4">{{ docs|qty }} fulfilments · {{ total|qty }} lines</td><td class="r">{{ qty_total|qty }}</td><td></td></tr></tfoot>{% endif %}
         </table></div>
+        {{ loadmore('tbl-ful') }}
       </div>
 
     {% elif view == "invoices" and invoice %}
@@ -245,16 +295,14 @@
 
     {% elif view == "invoices" %}
       <div class="card"><header><h3>Invoices</h3><span class="hint">3PL service charges on your account · click to view detail</span></header>
-        {{ tabletools('tbl-inv', customer.slug ~ '-invoices') }}
+        {{ pagedtools('invoice') }}
         <div class="tablewrap"><table id="tbl-inv">
           <thead><tr><th>Invoice</th><th>Date</th><th class="r">Amount</th><th>Status</th><th class="noexport"></th></tr></thead>
-          <tbody>{% for r in rows %}<tr class="clickrow" onclick="location.href='/c/{{ customer.slug }}/invoice/{{ r.id }}'">
-            <td><a class="id idlink" href="/c/{{ customer.slug }}/invoice/{{ r.id }}">{{ r.tranid }}</a></td><td>{{ r.trandate|dshort }}</td>
-            <td class="r num">${{ r.total|money }}</td><td><span class="chip {{ r.status|chip }}">{{ r.status }}</span></td>
-            <td class="r chev noexport">›</td></tr>
-          {% else %}<tr><td class="empty" colspan="5">No invoices.</td></tr>{% endfor %}</tbody>
-          {% if rows %}<tfoot><tr><td colspan="2">{{ rows|length }} invoices</td><td class="r">${{ rows|sum(attribute='total')|money }}</td><td colspan="2"></td></tr></tfoot>{% endif %}
+          <tbody>{{ R.invoice_rows(rows, customer) }}
+          {% if not rows %}<tr><td class="empty" colspan="5">{{ 'No invoices match that search.' if q else 'No invoices in this period.' }}</td></tr>{% endif %}</tbody>
+          {% if rows %}<tfoot><tr><td colspan="2">{{ total|qty }} invoices</td><td class="r">${{ qty_total|money }}</td><td colspan="2"></td></tr></tfoot>{% endif %}
         </table></div>
+        {{ loadmore('tbl-inv') }}
       </div>
 
     {% elif view == "rate_card" %}
@@ -349,8 +397,54 @@ function chartTab(key){
   chartTab(saved || 'billing');
 })();
 
+// Load more: fetch the next page of rows and append, so you keep your scroll position.
+// The element is a real <a> to the same view with a bigger n=, so returning true (or JS being
+// off entirely) falls back to a normal page load. Only the tail is requested — `have` tells the
+// server how many rows the client already has.
+// Sync wrapper: an inline `return loadMore(this)` must return a real boolean. An async
+// function returns a Promise, which is truthy, so the browser would follow the href and do a
+// full page load every time — the append path would never run.
+function loadMore(a){
+  var tbody = document.querySelector('#' + a.dataset.tbl + ' tbody');
+  if(!tbody || !window.fetch) return true;                 // no JS support: use the href
+  loadMoreAsync(a, tbody);
+  return false;
+}
+
+async function loadMoreAsync(a, tbody){
+  a.textContent = 'Loading…'; a.style.pointerEvents = 'none';
+  try{
+    var u = new URL(location.pathname + '/rows', location.origin);
+    new URLSearchParams(location.search).forEach(function(v, k){
+      if(k !== 'n') u.searchParams.set(k, v);
+    });
+    u.searchParams.set('n', new URL(a.href, location.origin).searchParams.get('n'));
+    u.searchParams.set('have', a.dataset.have);
+    var res = await fetch(u, {headers: {'X-Requested-With': 'fetch'}});
+    if(!res.ok) throw new Error(res.status);
+    var html = (await res.text()).trim();
+    if(html) tbody.insertAdjacentHTML('beforeend', html);
+    var have = tbody.querySelectorAll('tr').length;
+    var total = parseInt(a.dataset.total, 10);
+    var wrap = a.closest('.loadmore');
+    if(have >= total){ wrap.remove(); return; }
+    // rearm for the next page (href too, so the no-JS fallback stays correct)
+    a.dataset.have = have;
+    a.href = a.href.replace(/([?&]n=)\d+/, '$1' + (have + 100));
+    a.textContent = 'Load ' + Math.min(total - have, 100) + ' more';
+    a.style.pointerEvents = '';
+    var note = wrap.querySelector('.note');
+    if(note) note.textContent = have.toLocaleString() + ' of ' + total.toLocaleString() + ' shown';
+  }catch(e){
+    location.href = a.href;        // fetch failed — fall back to a full page load
+  }
+}
+
 // Client-side row filter for a data table. Hides non-matching rows; while a filter is
 // active the totals footer is hidden (it sums the full set, not the visible rows).
+// NOTE: only used by the small views (stock on hand / on order) where every row is present.
+// The paged views search server-side — see pagedtools() — so a match is never missed because
+// its row happened not to be rendered.
 function filterTable(id, q){
   q = (q || '').trim().toLowerCase();
   var t = document.getElementById(id); if(!t || !t.tBodies[0]) return;

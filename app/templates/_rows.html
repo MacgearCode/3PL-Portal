@@ -1,0 +1,27 @@
+{# Table rows for the three paged views. Rendered both inside portal.html and on its own by
+   GET /c/{slug}/{view}/rows (what Load more fetches), so the row markup exists once.
+   Rendered standalone this file emits ONLY <tr> elements — no wrapper, no whitespace that
+   would land outside a <tbody>. #}
+{%- macro receipt_rows(rows) -%}
+{%- for r in rows -%}
+<tr><td><span class="id">{{ r.tranid }}</span></td><td><span class="id">{{ r.po or '—' }}</span></td><td><span class="id">{{ r.shipment or '—' }}</span></td>
+  <td><span class="id">{{ r.sku }}</span></td><td class="prim">{{ r.name }}</td><td class="r num">{{ r.qty|qty }}</td><td>{{ r.trandate|dshort }}</td></tr>
+{%- endfor -%}
+{%- endmacro -%}
+
+{%- macro fulfilment_rows(rows) -%}
+{%- for r in rows -%}
+<tr><td><span class="id">{{ r.tranid }}</span></td>
+  <td>{% if r.source == 'VRMA' %}<span class="tag vrma">VRMA</span>{% else %}<span class="tag so">SO</span>{% endif %}</td>
+  <td><span class="id">{{ r.ref or '—' }}</span></td><td class="prim">{{ r.sku }}</td><td class="r num">{{ r.qty|qty }}</td><td>{{ r.trandate|dshort }}</td></tr>
+{%- endfor -%}
+{%- endmacro -%}
+
+{%- macro invoice_rows(rows, customer) -%}
+{%- for r in rows -%}
+<tr class="clickrow" onclick="location.href='/c/{{ customer.slug }}/invoice/{{ r.id }}'">
+  <td><a class="id idlink" href="/c/{{ customer.slug }}/invoice/{{ r.id }}">{{ r.tranid }}</a></td><td>{{ r.trandate|dshort }}</td>
+  <td class="r num">${{ r.total|money }}</td><td><span class="chip {{ r.status|chip }}">{{ r.status }}</span></td>
+  <td class="r chev noexport">›</td></tr>
+{%- endfor -%}
+{%- endmacro -%}
