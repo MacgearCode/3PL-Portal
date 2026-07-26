@@ -43,7 +43,18 @@ def _rate_card(db, customer, rates, effective_from=date(2026, 1, 1)):
 
 
 def _seed_mova_demo(db, mova):
-    """A month of plausible cached activity so every view renders with real-looking numbers."""
+    """A month of plausible cached activity so every view renders with real-looking numbers.
+
+    All dates are offsets from the Monday of the current week (`M`), not fixed calendar
+    dates — the overview's chart series are anchored to the wall clock, so hardcoded dates
+    would age out and leave the dashboard empty a few weeks after seeding.
+    """
+    today = date.today()
+    M = today - timedelta(days=today.weekday())          # Monday of this week
+
+    def d(days):
+        return M + timedelta(days=days)
+
     items = [
         Item(customer_id=mova.id, ns_item_id="90001", sku="010201AA000437",
              description="MOVA Z50 Ultra Wet and Dry Robotic Vacuum", units_per_pallet=48),
@@ -52,44 +63,55 @@ def _seed_mova_demo(db, mova):
     ]
     db.add_all(items)
 
-    # Inbound shipments (containers) — two received this month, one still in transit.
-    # The in-transit one (ISMOV0003) carries the outstanding PO stock + its expected receipt date.
+    # Inbound shipments (containers) — three landed over the last three weeks, two still
+    # in transit. The in-transit pair carries the outstanding PO stock + its expected
+    # receipt date, and is what the "Incoming" chart series buckets by week.
     db.add_all([
         InboundShipment(customer_id=mova.id, ns_shipment_id="IS5001",
                         shipment_number="ISMOV0001", container_type="40ft loose stacked",
-                        expected_date=date(2026, 6, 8),
-                        received_date=date(2026, 6, 8), status="received"),
+                        expected_date=d(-21), received_date=d(-21), status="received"),
         InboundShipment(customer_id=mova.id, ns_shipment_id="IS5002",
                         shipment_number="ISMOV0002", container_type="40ft loose stacked",
-                        expected_date=date(2026, 6, 22),
-                        received_date=date(2026, 6, 22), status="received"),
+                        expected_date=d(-14), received_date=d(-13), status="received"),
         InboundShipment(customer_id=mova.id, ns_shipment_id="IS5003",
                         shipment_number="ISMOV0003", container_type="40ft loose stacked",
-                        expected_date=date(2026, 7, 18),
-                        received_date=None, status="in transit"),
+                        expected_date=d(-7), received_date=d(-5), status="received"),
+        InboundShipment(customer_id=mova.id, ns_shipment_id="IS5004",
+                        shipment_number="ISMOV0004", container_type="40ft loose stacked",
+                        expected_date=d(9), received_date=None, status="in transit"),
+        InboundShipment(customer_id=mova.id, ns_shipment_id="IS5005",
+                        shipment_number="ISMOV0005", container_type="40ft loose stacked",
+                        expected_date=d(23), received_date=None, status="in transit"),
     ])
 
-    # Open PO (stock on order) — partially received. The first line's outstanding qty has
-    # been added to the in-transit shipment ISMOV0003 (so it shows the shipment + its ETA);
-    # the second line isn't on a shipment yet (falls back to its own expected date).
+    # Open POs (stock on order) — partially received. The first PO's outstanding lines sit
+    # on the two in-transit containers, so they inherit a real ETA. The second PO has no
+    # container yet and no line-level date, which is the "unscheduled" case the Incoming
+    # chart reports separately instead of dropping.
     po = PurchaseOrder(customer_id=mova.id, ns_po_id="PO7001", tranid="POAU010001",
-                       trandate=date(2026, 5, 30), status="open")
-    db.add(po)
+                       trandate=d(-30), status="open")
+    po2 = PurchaseOrder(customer_id=mova.id, ns_po_id="PO7002", tranid="POAU010002",
+                        trandate=d(-3), status="open")
+    db.add_all([po, po2])
     db.flush()
     db.add_all([
-        PoLine(purchase_order_id=po.id, ns_item_id="90001", qty_ordered=10000,
-               qty_received=6000, expected_date=date(2026, 7, 15),
-               ns_inbound_shipment="ISMOV0003"),
-        PoLine(purchase_order_id=po.id, ns_item_id="90002", qty_ordered=5000,
-               qty_received=0, expected_date=date(2026, 7, 28)),
+        PoLine(purchase_order_id=po.id, ns_item_id="90001", qty_ordered=12000,
+               qty_received=9000, ns_inbound_shipment="ISMOV0004"),
+        PoLine(purchase_order_id=po.id, ns_item_id="90002", qty_ordered=8000,
+               qty_received=5500, ns_inbound_shipment="ISMOV0005"),
+        PoLine(purchase_order_id=po2.id, ns_item_id="90001", qty_ordered=2000,
+               qty_received=0),
     ])
 
-    # Item receipts (putaway) — the two received containers.
-    for ns_id, tranid, d, qty1, qty2 in [
-        ("IR8001", "IRAU020001", date(2026, 6, 8), 6000, 0),
-        ("IR8002", "IRAU020002", date(2026, 6, 22), 0, 4000),
+    # Item receipts (putaway) — the three landed containers plus one this week. Quantities
+    # tie back to the PO lines above (90001: 6000+3000=9000, 90002: 4000+1500=5500).
+    for ns_id, tranid, day, qty1, qty2 in [
+        ("IR8001", "IRAU020001", d(-21), 6000, 0),
+        ("IR8002", "IRAU020002", d(-13), 0, 4000),
+        ("IR8003", "IRAU020003", d(-5), 3000, 0),
+        ("IR8004", "IRAU020004", min(d(1), today), 0, 1500),
     ]:
-        r = ItemReceipt(customer_id=mova.id, ns_receipt_id=ns_id, tranid=tranid, trandate=d)
+        r = ItemReceipt(customer_id=mova.id, ns_receipt_id=ns_id, tranid=tranid, trandate=day)
         db.add(r)
         db.flush()
         if qty1:
@@ -98,9 +120,10 @@ def _seed_mova_demo(db, mova):
             db.add(ItemReceiptLine(item_receipt_id=r.id, ns_item_id="90002", qty=qty2))
 
     # Weekly stock-on-hand snapshots (storage). Pallets = ceil(qoh / units_per_pallet).
+    # The last snapshot is stamped today so the SOH view reads as live.
     upp = {"90001": 48, "90002": 60}
-    for wk, (oh1, oh2) in enumerate([(6000, 0), (5400, 0), (5000, 4000), (4600, 3800)]):
-        snap_date = date(2026, 6, 1) + timedelta(days=7 * wk)
+    for snap_date, oh1, oh2 in [(d(-21), 6000, 0), (d(-14), 5400, 0),
+                                (d(-7), 7800, 3800), (today, 8200, 5100)]:
         for ns_item, oh in (("90001", oh1), ("90002", oh2)):
             if oh:
                 db.add(StockOnHand(
@@ -109,21 +132,24 @@ def _seed_mova_demo(db, mova):
                     pallets=math.ceil(oh / upp[ns_item])))
 
     # Fulfilments (picking) — SO dispatches plus one VRMA buy-in.
-    for ns_id, tranid, d, src, ns_item, qty in [
-        ("IF9001", "IFAU030001", date(2026, 6, 12), "SO", "90001", 600),
-        ("IF9002", "IFAU030002", date(2026, 6, 19), "SO", "90001", 400),
-        ("IF9003", "IFAU030003", date(2026, 6, 24), "VRMA", "90002", 200),
+    for ns_id, tranid, day, src, ns_item, qty in [
+        ("IF9001", "IFAU030001", d(-19), "SO", "90001", 600),
+        ("IF9002", "IFAU030002", d(-12), "SO", "90001", 400),
+        ("IF9003", "IFAU030003", d(-4), "VRMA", "90002", 200),
+        ("IF9004", "IFAU030004", min(d(2), today), "SO", "90001", 350),
     ]:
         f = ItemFulfilment(customer_id=mova.id, ns_fulfilment_id=ns_id, tranid=tranid,
-                           trandate=d, source_type=src)
+                           trandate=day, source_type=src)
         db.add(f)
         db.flush()
         db.add(ItemFulfilmentLine(item_fulfilment_id=f.id, ns_item_id=ns_item, qty=qty))
 
     # A prior invoice (service charges already raised), with its charge-line breakdown
     # so the customer can drill through and see exactly what was billed. Lines sum to total.
+    # Its period sits just before the 4-week window the dashboard shows, so it never
+    # collides with the re-billing guard on a week the user might run.
     inv = Invoice(customer_id=mova.id, ns_invoice_id="INV6001", tranid="INAU040001",
-                  trandate=date(2026, 6, 1), status="Open", total=12450.00)
+                  trandate=d(-21), status="Open", total=12450.00)
     db.add(inv)
     db.flush()
     charge_lines = [
@@ -139,9 +165,8 @@ def _seed_mova_demo(db, mova):
 
     # The completed billing run that produced INV6001 — shows the full loop
     # (run -> pushed -> invoiced) linked to the synced invoice via ns_invoice_id.
-    run = BillingRun(customer_id=mova.id, period_start=date(2026, 5, 26),
-                     period_end=date(2026, 6, 1), status="invoiced",
-                     ns_invoice_id=inv.ns_invoice_id)
+    run = BillingRun(customer_id=mova.id, period_start=d(-28), period_end=d(-22),
+                     status="invoiced", ns_invoice_id=inv.ns_invoice_id)
     db.add(run)
     db.flush()
     for ct, desc, qty, rate, amt in charge_lines:

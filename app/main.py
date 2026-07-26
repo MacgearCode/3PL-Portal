@@ -265,8 +265,9 @@ def _portal_ctx(request: Request, db: Session, customer: Customer, view: str) ->
     user = cur(request)
     allowed = perms.effective_views(user)
     imap = service.item_map(db, customer.id)
-    anchor = service.latest_activity_date(db, customer.id) or date.today()
-    wk_start, wk_end = service.week_bounds(anchor)
+    # Wall-clock week, matching service.overview() — the topbar label and the chart
+    # must never disagree about which week "this week" is.
+    wk_start, wk_end = service.week_bounds(date.today())
     title, sub = TITLES[view]
     return {"customer": customer,
             "customers": _customers(db) if perms.is_internal(user) else [customer],

@@ -3,6 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#25A9E1">
   <title>{% block title %}Macgear 3PL Portal{% endblock %}</title>
   <script>
     // Set the theme before first paint to avoid a flash. Saved choice wins; otherwise
@@ -20,7 +22,8 @@
       try{ localStorage.setItem('theme', cur); }catch(e){}
     }
   </script>
-  <link rel="stylesheet" href="/static/style.css">
+  {# ?v= is a manual cache-buster — bump it whenever style.css changes materially. #}
+  <link rel="stylesheet" href="/static/style.css?v=2">
 </head>
 <body>
 {% block body %}{% endblock %}

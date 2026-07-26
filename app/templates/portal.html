@@ -18,7 +18,7 @@
   <aside class="side">
     <a class="brand" href="/c/{{ customer.slug }}/overview" title="Back to overview">
       <div class="mark">
-        <svg width="19" height="19" viewBox="0 0 24 24" fill="none"><path d="M3 8.5 12 4l9 4.5v7L12 20l-9-4.5z" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/><path d="M3 8.5 12 13l9-4.5M12 13v7" stroke="#9FE7EC" stroke-width="1.4" stroke-linejoin="round"/></svg>
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none"><path d="M3 8.5 12 4l9 4.5v7L12 20l-9-4.5z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M3 8.5 12 13l9-4.5M12 13v7" stroke="currentColor" stroke-opacity=".62" stroke-width="1.4" stroke-linejoin="round"/></svg>
       </div>
       <div><b>Macgear 3PL</b><span>Logistics Portal</span></div>
     </a>
@@ -95,13 +95,55 @@
           <div class="val num">${{ d.week_total|money0 }}</div><div class="meta">{{ d.week_start|dshort }} – {{ d.week_end|dshort }}</div></div>
       </div>
       <div class="grid2">
-        <div class="card"><header><h3>Weekly 3PL charges</h3><span class="hint">last 4 billing weeks</span></header>
-          <div class="chart"><div class="bars">
-            {% for h in d.history %}
-            <div class="bar {{ 'cur' if loop.last }}"><span class="vl">${{ (h.total/1000)|round(1) }}k</span>
-              <div class="fill" style="height:{{ (h.total / d.history_max * 100)|round }}%"></div><span class="lb">{{ h.label }}</span></div>
-            {% endfor %}
-          </div></div>
+        {# One card, three server-rendered series; chartTab() swaps which carries .is-on.
+           No chart library — bar heights are baked in as inline percentages. #}
+        <div class="card">
+          <header><h3>Weekly activity</h3>
+            <div class="segbtns" role="tablist" aria-label="Chart series">
+              <button type="button" role="tab" data-series="received" aria-selected="false" onclick="chartTab('received')">Received</button>
+              <button type="button" role="tab" data-series="incoming" aria-selected="false" onclick="chartTab('incoming')">Incoming</button>
+              <button type="button" role="tab" data-series="billing" aria-selected="true" onclick="chartTab('billing')">Billing</button>
+            </div>
+          </header>
+          <div class="chart">
+            {% if d.received|sum(attribute='total') %}
+            <div class="bars" data-series="received" role="tabpanel" aria-label="Units received per week">
+              {% for h in d.received %}
+              <div class="bar {{ 'cur' if loop.last }} {{ 'zero' if not h.total }}"><span class="vl">{{ h.total|qty }}</span>
+                <div class="fill" style="height:{{ (h.total / d.received_max * 100)|round }}%"></div><span class="lb">{{ h.label }}</span></div>
+              {% endfor %}
+            </div>
+            {% else %}
+            <div class="empty" data-series="received">No stock received in the last 4 weeks.</div>
+            {% endif %}
+
+            {% if d.incoming|sum(attribute='total') %}
+            <div class="bars forecast" data-series="incoming" role="tabpanel" aria-label="Incoming units, next 4 weeks">
+              {% for h in d.incoming %}
+              <div class="bar {{ 'cur' if loop.first }} {{ 'zero' if not h.total }}"><span class="vl">{{ h.total|qty }}</span>
+                <div class="fill" style="height:{{ (h.total / d.incoming_max * 100)|round }}%"></div><span class="lb">{{ h.label }}</span></div>
+              {% endfor %}
+            </div>
+            {% else %}
+            <div class="empty" data-series="incoming">Nothing scheduled to arrive in the next 4 weeks.</div>
+            {% endif %}
+
+            {# billing is the default series, marked on server-side so the card still
+               renders something with JS disabled #}
+            {% if d.history|sum(attribute='total') %}
+            <div class="bars is-on" data-series="billing" role="tabpanel" aria-label="3PL charges per billing week">
+              {% for h in d.history %}
+              <div class="bar {{ 'cur' if loop.last }} {{ 'zero' if not h.total }}"><span class="vl">${{ (h.total/1000)|round(1) }}k</span>
+                <div class="fill" style="height:{{ (h.total / d.history_max * 100)|round }}%"></div><span class="lb">{{ h.label }}</span></div>
+              {% endfor %}
+            </div>
+            {% else %}
+            <div class="empty is-on" data-series="billing">No charges in the last 4 billing weeks.</div>
+            {% endif %}
+          </div>
+          <div class="chartnote" data-series="received">Units received per week — last 4 weeks</div>
+          <div class="chartnote" data-series="incoming">Outstanding on-order units by expected arrival — next 4 weeks{% if d.incoming_unscheduled %} · <b>{{ d.incoming_unscheduled|qty }}</b> units with no confirmed date are not shown{% endif %}</div>
+          <div class="chartnote is-on" data-series="billing">Total 3PL charges — last 4 billing weeks</div>
         </div>
         <div class="card"><header><h3>This week so far</h3></header>
           <div class="pad weekpanel">
@@ -283,6 +325,24 @@
 </div>
 <script>
 function toggleNav(){document.querySelector('.app').classList.toggle('navopen')}
+
+// Overview chart: all three series are already in the DOM, so switching is just a class
+// swap. The choice is remembered the same way the theme is (base.html).
+function chartTab(key){
+  document.querySelectorAll('.chart > [data-series], .chartnote').forEach(function(el){
+    el.classList.toggle('is-on', el.dataset.series === key);
+  });
+  document.querySelectorAll('.segbtns button').forEach(function(b){
+    b.setAttribute('aria-selected', b.dataset.series === key ? 'true' : 'false');
+  });
+  try{ localStorage.setItem('chartSeries', key); }catch(e){}
+}
+(function(){
+  if(!document.querySelector('.segbtns')) return;   // not the overview
+  var saved;
+  try{ saved = localStorage.getItem('chartSeries'); }catch(e){}
+  chartTab(saved || 'billing');
+})();
 
 // Client-side row filter for a data table. Hides non-matching rows; while a filter is
 // active the totals footer is hidden (it sums the full set, not the visible rows).

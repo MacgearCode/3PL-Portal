@@ -6,7 +6,7 @@
   <a class="link" href="/admin/customers">← All customers</a>
 </div>
 {% if request.query_params.get('saved') %}<div class="savedbar">✓ Saved.</div>{% endif %}
-{% if error %}<div class="savedbar" style="background:#fdecec;color:#a12626">⚠ {{ error }}</div>{% endif %}
+{% if error %}<div class="flash crit">⚠ {{ error }}</div>{% endif %}
 
 <form class="card formcard" method="post"
       action="{% if is_new %}/admin/customers/new{% else %}/admin/customers/{{ c.id }}{% endif %}">

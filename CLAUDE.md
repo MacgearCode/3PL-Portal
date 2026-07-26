@@ -15,8 +15,28 @@ FastAPI + SQLAlchemy, `DATABASE_URL` (SQLite local / Postgres droplet). `app/mai
 switcher, 6 views, billing run, admin console, token `/admin/ingest` + `/admin/billing/*`), `models.py`,
 `service.py` (read views), `billing.py` (the 5 charges), `netsuite.py` (ingest_* upserts; app never calls NS),
 `perms.py` (roles + view permissions), `security.py` (pbkdf2 + signed cookie), `seed.py`.
-Portal UI matches `prototype/portal.html` (teal sidebar, KPI cards, chart, chips) and is responsive
-(off-canvas nav drawer ≤860px). Deploy pattern = vendor-credit-claims app (Docker on n8n droplet, weekly n8n sync job).
+Deploy pattern = vendor-credit-claims app (Docker on n8n droplet, weekly n8n sync job).
+
+## UI / brand (re-themed 2026-07-26)
+**Macgear palette, white app + optional dark mode.** Blue `#25A9E1` = accent, grey `#58585A` ramp = ink
+and chrome. Everything is driven off CSS custom properties in `app/static/style.css` (`:root` +
+`[data-theme="dark"]`) — no hardcoded colours anywhere in the CSS or templates, so both themes come free.
+Two blues by necessity: core `#25A9E1` is 2.4:1 on white and can't carry text, so it's accent-only
+(`--brand`) and `--brand-strong` (blue-700 `#16739C`) carries links + filled buttons; `--on-brand` is the
+text colour on a filled button and flips to near-black in dark mode where the button goes bright.
+Dark mode: `data-theme` on `<html>`, no-flash inline script in `base.html`, topbar toggle, localStorage
+with OS-preference fallback. The sidebar and admin header are now **white in light mode** (they used to be
+hardcoded dark teal in both). `prototype/portal.html` was deliberately **not** re-themed — it's still teal.
+Responsive: off-canvas nav drawer ≤860px; chart's segmented control drops to its own line ≤560px.
+
+**Overview chart** — one card, three selectable series (segmented pills, default = Billing, choice
+remembered in localStorage): *Received* (units received per week, last 4), *Incoming* (outstanding
+on-order units bucketed by expected arrival, next 4 — forecast bars are visually distinct; units with no
+confirmed ETA are reported in a note, never silently dropped), *Billing* (charges per week, last 4).
+Still no chart library — server-rendered divs with inline heights; `chartTab()` just swaps a class.
+All three series and the topbar billing week anchor to **`date.today()`** (they used to anchor to the
+cache's latest activity date, which a forward-looking series can't share). Consequence: `app/seed.py`
+demo dates are now offsets from the current Monday, so the demo never ages out.
 
 ## Auth, roles & admin (built)
 Per-user login (email + pbkdf2 password, signed-cookie session). Table `app_user`. **Roles:** `admin`

@@ -1,8 +1,10 @@
 """Read-side helpers: turn cache tables into the 6 portal views + overview.
 
 Items are resolved to SKUs via a per-customer ns_item_id -> sku map so the portal shows
-human SKUs, not NetSuite internal ids. The "current billing week" is anchored to the latest
-activity in the cache (not the wall clock) so the demo always shows populated numbers.
+human SKUs, not NetSuite internal ids. The "current billing week" is the wall-clock
+Monday–Sunday week; latest_activity_date() is kept for callers that want the cache's own
+high-water mark, but the overview no longer anchors to it (the incoming-units series is
+forward-looking and has to agree with the calendar).
 """
 import math
 from datetime import date, timedelta
@@ -212,21 +214,65 @@ def week_bounds(d: date) -> tuple[date, date]:
     return mon, mon + timedelta(days=6)
 
 
+def received_per_week(db: Session, customer_id: int, weeks: list[tuple[date, date]]) -> list[dict]:
+    """Item-receipt units per week — the same count billing charges putaway on
+    (billing.py), but as a series instead of a single period."""
+    out = []
+    for s, e in weeks:
+        recs = db.scalars(
+            select(ItemReceipt).where(
+                ItemReceipt.customer_id == customer_id,
+                ItemReceipt.trandate >= s,
+                ItemReceipt.trandate <= e)).all()
+        out.append({"label": s.strftime("%d %b"),
+                    "total": sum(float(l.qty) for r in recs for l in r.lines)})
+    return out
+
+
+def incoming_per_week(soo: list[dict], weeks: list[tuple[date, date]]) -> tuple[list[dict], float]:
+    """Bucket outstanding on-order units into the given weeks by expected arrival.
+
+    Works off stock_on_order() rows, which already resolve the authoritative ETA
+    (inbound shipment's expected date, falling back to the PO line's). Anything with no
+    ETA — or an ETA outside the window — is returned separately as `unscheduled` rather
+    than being silently dropped, so the bars and the "units on order" KPI reconcile.
+    """
+    buckets = [{"label": s.strftime("%d %b"), "total": 0.0} for s, _ in weeks]
+    placed = 0.0
+    for r in soo:
+        exp = r.get("expected")
+        if not exp:
+            continue
+        for i, (s, e) in enumerate(weeks):
+            if s <= exp <= e:
+                buckets[i]["total"] += r["outstanding"]
+                placed += r["outstanding"]
+                break
+    unscheduled = sum(r["outstanding"] for r in soo) - placed
+    return buckets, unscheduled
+
+
 # --- overview ----------------------------------------------------------------
 def overview(db: Session, customer: Customer, imap: dict) -> dict:
     soh = stock_on_hand(db, customer.id, imap)
     soo = stock_on_order(db, customer.id, imap)
-    anchor = latest_activity_date(db, customer.id) or date.today()
+    # Anchored to the wall clock: the forward-looking series is meaningless against a
+    # data-derived anchor, and mixing the two would put the three chart series on
+    # different calendars.
+    anchor = date.today()
     wk_start, wk_end = week_bounds(anchor)
+
+    past_weeks = [week_bounds(anchor - timedelta(days=7 * i)) for i in range(3, -1, -1)]
+    next_weeks = [week_bounds(anchor + timedelta(days=7 * i)) for i in range(4)]
 
     # current week charge breakdown + 4-week history, both from the billing engine
     cur = compute_billing(db, customer, wk_start, wk_end)
     by_type = {l.charge_type: l for l in cur.lines}
-    history = []
-    for i in range(3, -1, -1):
-        s, e = week_bounds(anchor - timedelta(days=7 * i))
-        res = compute_billing(db, customer, s, e)
-        history.append({"label": s.strftime("%d %b"), "total": res.total})
+    history = [{"label": s.strftime("%d %b"),
+                "total": compute_billing(db, customer, s, e).total}
+               for s, e in past_weeks]
+    received = received_per_week(db, customer.id, past_weeks)
+    incoming, unscheduled = incoming_per_week(soo, next_weeks)
 
     recent = (item_receipts(db, customer.id, imap)[:2] +
               fulfilments(db, customer.id, imap)[:3])
@@ -252,7 +298,14 @@ def overview(db: Session, customer: Customer, imap: dict) -> dict:
                                        ("putaway", "Putaway"), ("storage", "Storage"),
                                        ("picking_so", "Picking — SO"),
                                        ("picking_vrma", "Picking — VRMA")]],
+        # three selectable chart series; *_max is floored at 1 so the bar-height
+        # division in the template can never hit zero
         "history": history,
         "history_max": max((h["total"] for h in history), default=0) or 1,
+        "received": received,
+        "received_max": max((h["total"] for h in received), default=0) or 1,
+        "incoming": incoming,
+        "incoming_max": max((h["total"] for h in incoming), default=0) or 1,
+        "incoming_unscheduled": unscheduled,
         "recent": recent,
     }
