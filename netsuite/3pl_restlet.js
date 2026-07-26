@@ -102,22 +102,50 @@ define(['N/query', 'N/record'], function (query, record) {
     // often has no class) so shared locations don't leak other customers' receipts, PLUS the 3PL
     // location for location_scoped customers — otherwise Mova's regular MOVA brand pulls in every
     // owned-inventory receipt into regular warehouses, not just 3PL putaways (fixed 2026-07-22).
-    // po_tranid: the source PO's document number. createdfrom is not selectable in SuiteQL, so
-    // walk previoustransactionlinelink (receipt = nextdoc) back to a PurchOrd. Null when the
-    // receipt came from something else (e.g. a transfer order), so only true PO receipts show one.
+    // The receipts themselves come first, on their own, with NO subquery. This read drives the
+    // putaway charge, so it must not be able to fail for a decorative reason (see below).
     var flat = runSuiteQL(
-      "SELECT t.id, t.tranid, t.trandate, " +
-      "(SELECT MIN(po.tranid) FROM previoustransactionlinelink ptll " +
-      "JOIN transaction po ON po.id=ptll.previousdoc " +
-      "WHERE ptll.nextdoc=t.id AND po.type='PurchOrd') po_tranid, " +
-      "tl.item, tl.quantity FROM transaction t " +
+      "SELECT t.id, t.tranid, t.trandate, tl.item, tl.quantity FROM transaction t " +
       "JOIN transactionline tl ON tl.transaction=t.id JOIN item i ON i.id=tl.item " +
       "WHERE t.type='ItemRcpt' AND i.class=" + Number(p.ns_class_id) + locClause(p, 'tl') +
       " AND tl.mainline='F' AND tl.taxline='F' AND t.trandate >= " + sinceExpr(p.since));
-    return group(flat, 'id',
+
+    // po_tranid: the source PO's document number, shown in the portal's "PO" column. createdfrom
+    // is not selectable in SuiteQL, so walk previoustransactionlinelink (receipt = nextdoc) back
+    // to a PurchOrd. Null when the receipt came from something else (e.g. a transfer order).
+    //
+    // Fetched SEPARATELY and in a try/catch, on purpose. It used to be a correlated subquery in
+    // the SELECT list above, which made the *entire* receipts read all-or-nothing: any problem
+    // reaching previoustransactionlinelink (it's a system table a restricted integration role may
+    // not be able to read) lost all 9 receipts AND the whole putaway charge, to populate one
+    // cosmetic column. Now a failure blanks that column and nothing else. Scoped by receipt id —
+    // the same id-list pattern inboundShipments uses — so it stays cheap and can't pull in other
+    // subsidiaries' receipts.
+    var poByReceipt = {}, rcptIds = {};
+    flat.forEach(function (r) { rcptIds[String(r.id)] = true; });
+    var idList = Object.keys(rcptIds);
+    if (idList.length) {
+      try {
+        runSuiteQL(
+          "SELECT ptll.nextdoc receipt, MIN(po.tranid) po_tranid " +
+          "FROM previoustransactionlinelink ptll " +
+          "JOIN transaction po ON po.id=ptll.previousdoc " +
+          "WHERE po.type='PurchOrd' AND ptll.nextdoc IN (" + idList.join(',') + ") " +
+          "GROUP BY ptll.nextdoc"
+        ).forEach(function (r) { poByReceipt[String(r.receipt)] = r.po_tranid || null; });
+      } catch (e) {
+        // Leave the PO column blank rather than losing the receipts. Surfaced on the response so
+        // it doesn't fail silently — n8n logs the whole payload.
+        poByReceipt.__error = (e && e.message) || String(e);
+      }
+    }
+    var warn = poByReceipt.__error || null;
+    var out = group(flat, 'id',
       function (r) { return { ns_receipt_id: String(r.id), tranid: r.tranid, trandate: r.trandate,
-                              po_tranid: r.po_tranid || null }; },
+                              po_tranid: poByReceipt[String(r.id)] || null }; },
       function (r) { return { ns_item_id: String(r.item), qty: r.quantity }; });
+    if (warn && out.length) out[0].po_lookup_warning = warn;   // ignored by the app's ingest
+    return out;
   }
 
   function itemFulfilments(p) {
