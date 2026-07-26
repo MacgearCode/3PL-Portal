@@ -14,20 +14,43 @@
 
 const crypto = require('crypto');
 
-// ---------- CONFIG (sandbox). Only the 4 TBA secrets + SYNC_TOKEN are left to fill. ----------
+// ---------- CONFIG ----------
+// PREFER ENVIRONMENT VARIABLES FOR THE SECRETS. A Code node's body is stored in the n8n
+// workflow record and travels in every workflow export/backup as PLAIN TEXT — unlike an n8n
+// credential, it is not encrypted with N8N_ENCRYPTION_KEY. Pasting live NetSuite keys inline
+// therefore leaks them to anyone who can read the workflow or its backups.
+// Set these on the n8n container instead (see docs/production_cutover.md §3):
+//   NS_ACCOUNT_ID NS_CONSUMER_KEY NS_CONSUMER_SECRET NS_TOKEN_ID NS_TOKEN_SECRET
+//   NS_RESTLET_SCRIPT NS_RESTLET_DEPLOY THREEPL_SYNC_TOKEN
+// env() falls back to the inline value when a var is unset, or when $env access is blocked
+// (N8N_BLOCK_ENV_ACCESS_IN_NODE=true) — so existing inline wiring keeps working unchanged.
+//
 // To move to PRODUCTION, swap only the NetSuite-side values: ACCOUNT_ID (drop _SB1), the 4 TBA
 // secrets (prod integration+token), RESTLET_SCRIPT/DEPLOY (deploy the RESTlet in prod), and the
 // CHARGE_ITEMS ids (items created in prod will have different internalids). App side is unchanged.
-const ACCOUNT_ID      = '840974_SB1';                // node derives host 840974-sb1.restlets...; realm stays 840974_SB1
-const CONSUMER_KEY    = 'REPLACE_CONSUMER_KEY';
-const CONSUMER_SECRET = 'REPLACE_CONSUMER_SECRET';
-const TOKEN_ID        = 'REPLACE_TOKEN_ID';
-const TOKEN_SECRET    = 'REPLACE_TOKEN_SECRET';
-const RESTLET_SCRIPT  = '1343';                      // "script=" in the RESTlet deploy URL
-const RESTLET_DEPLOY  = '1';                         // "deploy=" in the RESTlet deploy URL
+function env(name, fallback) {
+  try {
+    var v = $env[name];
+    return (v === undefined || v === null || v === '') ? fallback : String(v);
+  } catch (e) { return fallback; }   // $env access blocked by n8n config
+}
+const ACCOUNT_ID      = env('NS_ACCOUNT_ID', '840974_SB1');   // host = lowercase, _ -> -; realm = as-is
+const CONSUMER_KEY    = env('NS_CONSUMER_KEY',    'REPLACE_CONSUMER_KEY');
+const CONSUMER_SECRET = env('NS_CONSUMER_SECRET', 'REPLACE_CONSUMER_SECRET');
+const TOKEN_ID        = env('NS_TOKEN_ID',        'REPLACE_TOKEN_ID');
+const TOKEN_SECRET    = env('NS_TOKEN_SECRET',    'REPLACE_TOKEN_SECRET');
+const RESTLET_SCRIPT  = env('NS_RESTLET_SCRIPT', '1343');     // "script=" in the RESTlet deploy URL
+const RESTLET_DEPLOY  = env('NS_RESTLET_DEPLOY', '1');        // "deploy=" in the RESTlet deploy URL
 const APP_BASE        = 'http://threepl:8000';       // app on the shared Docker network (n8n-docker-caddy_default)
-const SYNC_TOKEN      = 'REPLACE_SYNC_TOKEN';        // == SYNC_TOKEN in /opt/threepl/3PL-Portal/.env on the droplet
+const SYNC_TOKEN      = env('THREEPL_SYNC_TOKEN', 'REPLACE_SYNC_TOKEN');  // == SYNC_TOKEN in the app's .env
 const SINCE           = '2025-01-01';                // incremental floor for dated reads
+// Fail loudly rather than firing unsigned/mis-signed requests at NetSuite all night.
+for (const [k, v] of Object.entries({ CONSUMER_KEY, CONSUMER_SECRET, TOKEN_ID, TOKEN_SECRET, SYNC_TOKEN })) {
+  if (String(v).indexOf('REPLACE_') === 0) {
+    throw new Error(k + ' is not configured — set the matching env var on the n8n container '
+                      + '(or fill the inline fallback). See docs/production_cutover.md §3.');
+  }
+}
 
 // Customers to sync are NOT hardcoded here — they're fetched from the app's
 // /admin/sync-config (managed in the admin console: Customers > + Add customer).

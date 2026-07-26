@@ -57,5 +57,21 @@ A period already queued/pushed/invoiced is locked against re-billing.
      defaults to full, so any pre-existing single-schedule wiring keeps working unchanged.
 
 ## Validated NetSuite ids (from `netsuite_validation.md`)
-Mova: location `49`, class `237` (regular MOVA brand — dedicated `253` dropped 2026-07-22). Skriva: customer `10496`, vendor `10503`, location `2`, class `236`.
-`inbound_shipments` read action is TODO — confirm `inboundshipment` field names against real Mova data.
+Mova: location `49`, class `237` (regular MOVA brand — dedicated `253` dropped 2026-07-22),
+vendor `10872` (Mova Technologies (AU) **$AUD** — not the $USD `10504`), subsidiary `2` (MacGear AU).
+Skriva: customer `10496`, vendor `10503`, location `2`, class `236`.
+`inbound_shipments` read action validated 2026-06-30.
+
+## Going to production
+See **`production_cutover.md`** — verified prod ids, the full TBA/integration/role/token setup with
+a per-hop smoke test and an error-signature table, the three decisions still open (3PL billing
+customer, `CHARGE_ITEMS` remap, container-unload item), the expected first-sync numbers, and the
+**cache purge that must happen before the first production sync** (most ingests upsert without
+pruning, so sandbox receipts/fulfilments/shipments would be billed a second time).
+
+**Secrets:** the n8n Code node reads the four TBA secrets + `SYNC_TOKEN` from **environment
+variables** (`NS_CONSUMER_KEY`, `NS_CONSUMER_SECRET`, `NS_TOKEN_ID`, `NS_TOKEN_SECRET`,
+`NS_ACCOUNT_ID`, `NS_RESTLET_SCRIPT`, `NS_RESTLET_DEPLOY`, `THREEPL_SYNC_TOKEN`), falling back to
+inline constants when unset. A Code node body is stored and exported as plain text — unlike an n8n
+credential it is **not** encrypted with `N8N_ENCRYPTION_KEY` — so live keys should not be pasted
+inline. The node throws on startup if any secret is still `REPLACE_…`.
