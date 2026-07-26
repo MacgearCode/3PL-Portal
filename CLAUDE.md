@@ -31,8 +31,12 @@ Responsive: off-canvas nav drawer ≤860px; chart's segmented control drops to i
 
 **Overview chart** — one card, three selectable series (segmented pills, default = Billing, choice
 remembered in localStorage): *Received* (units received per week, last 4), *Incoming* (outstanding
-on-order units bucketed by expected arrival, next 4 — forecast bars are visually distinct; units with no
-confirmed ETA are reported in a note, never silently dropped), *Billing* (charges per week, last 4).
+on-order units bucketed by expected arrival, next 4 — forecast bars are visually distinct; anything that
+can't sit in a bar is named in the note as **overdue / due later / no expected date**, never silently
+dropped, so the bars always reconcile with the "units on order" KPI), *Billing* (charges per week, last 4).
+**ETA source:** `tl.expectedreceiptdate` on the PO line (the RESTlet omitted it until 2026-07-26 — that's
+why Expected receipt was blank in prod and Incoming was empty); an inbound shipment's
+`expecteddeliverydate` overrides it at read time when the line is on a container.
 Still no chart library — server-rendered divs with inline heights; `chartTab()` just swaps a class.
 All three series and the topbar billing week anchor to **`date.today()`** (they used to anchor to the
 cache's latest activity date, which a forward-looking series can't share). Consequence: `app/seed.py`

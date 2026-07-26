@@ -51,6 +51,12 @@ VRMA = type **`VendAuth`** (none in Skriva history — it's the Mova "Macgear bu
 - **Item fulfilments emit paired +qty / −qty lines** for the same item (item line vs inventory-impact line).
   For pick-fee counting **sum positive quantities only** — do NOT net them (would give 0).
 - **Open PO test:** PO line where `quantityshiprecv < quantity`. Status-independent and reliable.
+- **`transactionline.expectedreceiptdate` IS selectable on PO lines** (validated 2026-07-26 against live
+  prod: open Mova 3PL lines at loc 49 all returned `28/08/2026`). It was originally left out of the
+  RESTlet's PO query, which is why the portal's **Expected receipt** column was blank for every line not
+  yet on an inbound shipment — and why those units never reached the Incoming chart. Now selected.
+  Precedence: the **inbound shipment's `expecteddeliverydate` still wins** when the line is on a container
+  (resolved at read time in `service.stock_on_order`); the line's date is the fallback.
 - **Picking source (SO vs VRMA):** discriminate by the fulfilment's `entity` — customer id ⇒ SO pick,
   vendor id ⇒ VRMA pick. (Can't use `createdfrom`.)
 - **Skriva invoices are $0 product invoices, not service charges.** Skriva isn't billed 3PL fees in NetSuite
@@ -65,7 +71,8 @@ VRMA = type **`VendAuth`** (none in Skriva history — it's the Mova "Macgear bu
 ```sql
 SELECT t.id, t.tranid, t.trandate, tl.item, BUILTIN.DF(tl.item) item_name,
        tl.quantity ordered, tl.quantityshiprecv received,
-       (tl.quantity - tl.quantityshiprecv) outstanding
+       (tl.quantity - tl.quantityshiprecv) outstanding,
+       tl.expectedreceiptdate expected
 FROM transaction t JOIN transactionline tl ON tl.transaction = t.id
 WHERE t.type='PurchOrd' AND t.entity=:vend AND tl.location=:loc
   AND tl.mainline='F' AND tl.taxline='F' AND tl.quantityshiprecv < tl.quantity

@@ -78,16 +78,23 @@ define(['N/query', 'N/record'], function (query, record) {
     // Scope by vendor + the item's brand class, plus the 3PL location for location_scoped customers
     // (the PO line DOES carry the receiving location — verified 2026-07-22 — so a Mova-brand PO
     // receiving into a regular warehouse is correctly excluded from the 3PL portal).
+    // tl.expectedreceiptdate is the PO line's own ETA. It IS selectable (validated against live
+    // data 2026-07-26) — omitting it was why the portal's Expected Receipt column was always blank
+    // for lines not yet on an inbound shipment, and why those units never reached the Incoming
+    // chart. The shipment's expecteddeliverydate still wins at read time when one exists
+    // (service.stock_on_order) — a booked container beats the line's planning date.
     var flat = runSuiteQL(
       "SELECT t.id, t.tranid, t.trandate, BUILTIN.DF(t.status) status, tl.item, " +
-      "tl.quantity ordered, tl.quantityshiprecv received FROM transaction t " +
+      "tl.quantity ordered, tl.quantityshiprecv received, tl.expectedreceiptdate expected " +
+      "FROM transaction t " +
       "JOIN transactionline tl ON tl.transaction=t.id JOIN item i ON i.id=tl.item " +
       "WHERE t.type='PurchOrd' AND t.entity=" + Number(p.ns_supplier_id) +
       " AND i.class=" + Number(p.ns_class_id) + locClause(p, 'tl') +
       " AND tl.mainline='F' AND tl.taxline='F' AND tl.quantityshiprecv < tl.quantity");
     return group(flat, 'id',
       function (r) { return { ns_po_id: String(r.id), tranid: r.tranid, trandate: r.trandate, status: r.status }; },
-      function (r) { return { ns_item_id: String(r.item), qty_ordered: r.ordered, qty_received: r.received }; });
+      function (r) { return { ns_item_id: String(r.item), qty_ordered: r.ordered, qty_received: r.received,
+                              expected_date: r.expected || null }; });
   }
 
   function itemReceipts(p) {

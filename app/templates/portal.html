@@ -142,7 +142,12 @@
             {% endif %}
           </div>
           <div class="chartnote" data-series="received">Units received per week — last 4 weeks</div>
-          <div class="chartnote" data-series="incoming">Outstanding on-order units by expected arrival — next 4 weeks{% if d.incoming_unscheduled %} · <b>{{ d.incoming_unscheduled|qty }}</b> units with no confirmed date are not shown{% endif %}</div>
+          {# Anything that can't sit in a bar is named here, so the bars always reconcile
+             with the "units on order" KPI. #}
+          <div class="chartnote" data-series="incoming">Outstanding on-order units by expected arrival — next 4 weeks{%
+            if d.incoming_rest.overdue %} · <b>{{ d.incoming_rest.overdue|qty }}</b> overdue{% endif %}{%
+            if d.incoming_rest.later %} · <b>{{ d.incoming_rest.later|qty }}</b> due later{% endif %}{%
+            if d.incoming_rest.undated %} · <b>{{ d.incoming_rest.undated|qty }}</b> with no expected date{% endif %}</div>
           <div class="chartnote is-on" data-series="billing">Total 3PL charges — last 4 billing weeks</div>
         </div>
         <div class="card"><header><h3>This week so far</h3></header>

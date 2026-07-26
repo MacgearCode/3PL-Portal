@@ -229,27 +229,36 @@ def received_per_week(db: Session, customer_id: int, weeks: list[tuple[date, dat
     return out
 
 
-def incoming_per_week(soo: list[dict], weeks: list[tuple[date, date]]) -> tuple[list[dict], float]:
+def incoming_per_week(soo: list[dict], weeks: list[tuple[date, date]]) -> tuple[list[dict], dict]:
     """Bucket outstanding on-order units into the given weeks by expected arrival.
 
-    Works off stock_on_order() rows, which already resolve the authoritative ETA
-    (inbound shipment's expected date, falling back to the PO line's). Anything with no
-    ETA — or an ETA outside the window — is returned separately as `unscheduled` rather
-    than being silently dropped, so the bars and the "units on order" KPI reconcile.
+    Works off stock_on_order() rows, which already resolve the authoritative ETA (the
+    inbound shipment's expected date when the line is on a container, else the PO line's
+    own expectedreceiptdate).
+
+    Anything that can't land in a bar is counted in the returned `rest` dict rather than
+    silently dropped, so the bars always reconcile with the "units on order" KPI:
+      overdue  — ETA already past (late, not undated: it needs chasing, not scheduling)
+      later    — ETA beyond the 4-week window
+      undated  — no ETA at all on the line or its shipment
     """
     buckets = [{"label": s.strftime("%d %b"), "total": 0.0} for s, _ in weeks]
-    placed = 0.0
+    rest = {"overdue": 0.0, "later": 0.0, "undated": 0.0}
+    first, last = weeks[0][0], weeks[-1][1]
     for r in soo:
-        exp = r.get("expected")
+        exp, qty = r.get("expected"), r["outstanding"]
         if not exp:
-            continue
-        for i, (s, e) in enumerate(weeks):
-            if s <= exp <= e:
-                buckets[i]["total"] += r["outstanding"]
-                placed += r["outstanding"]
-                break
-    unscheduled = sum(r["outstanding"] for r in soo) - placed
-    return buckets, unscheduled
+            rest["undated"] += qty
+        elif exp < first:
+            rest["overdue"] += qty
+        elif exp > last:
+            rest["later"] += qty
+        else:
+            for i, (s, e) in enumerate(weeks):
+                if s <= exp <= e:
+                    buckets[i]["total"] += qty
+                    break
+    return buckets, rest
 
 
 # --- overview ----------------------------------------------------------------
@@ -272,7 +281,7 @@ def overview(db: Session, customer: Customer, imap: dict) -> dict:
                 "total": compute_billing(db, customer, s, e).total}
                for s, e in past_weeks]
     received = received_per_week(db, customer.id, past_weeks)
-    incoming, unscheduled = incoming_per_week(soo, next_weeks)
+    incoming, incoming_rest = incoming_per_week(soo, next_weeks)
 
     recent = (item_receipts(db, customer.id, imap)[:2] +
               fulfilments(db, customer.id, imap)[:3])
@@ -306,6 +315,6 @@ def overview(db: Session, customer: Customer, imap: dict) -> dict:
         "received_max": max((h["total"] for h in received), default=0) or 1,
         "incoming": incoming,
         "incoming_max": max((h["total"] for h in incoming), default=0) or 1,
-        "incoming_unscheduled": unscheduled,
+        "incoming_rest": incoming_rest,   # overdue / later / undated — see the chart note
         "recent": recent,
     }

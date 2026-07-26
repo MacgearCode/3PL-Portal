@@ -111,13 +111,16 @@ def ingest_purchase_orders(db: Session, c: Customer, rows: list[dict]) -> int:
                      customer_id=c.id, tranid=r.get("tranid"),
                      trandate=_date(r.get("trandate")), status=r.get("status"))
         db.flush()
-        # PRESERVE THE SHIPMENT LINK across this delete+recreate. The PO pull carries neither
-        # ns_inbound_shipment nor expected_date — those are stamped onto the line by the LATER
-        # inbound_shipments ingest. A naive rebuild blanks both every run, so if that pass
-        # errors/times out (it's the heaviest read) the Stock-on-order shipment + expected-receipt
-        # columns vanish until the next good full run. Snapshot the stamped values (keyed by item,
-        # which is effectively unique per PO — see the match in ingest_inbound_shipments) and carry
-        # them forward whenever the incoming pull doesn't supply them.
+        # PRESERVE THE SHIPMENT LINK across this delete+recreate. ns_inbound_shipment is not in
+        # the PO pull — it's stamped onto the line by the LATER inbound_shipments ingest. A naive
+        # rebuild blanks it every run, so if that pass errors/times out (it's the heaviest read)
+        # the Stock-on-order shipment column vanishes until the next good full run. Snapshot it
+        # (keyed by item, effectively unique per PO — see the match in ingest_inbound_shipments)
+        # and carry it forward when the incoming pull doesn't supply it.
+        # expected_date DOES come from the PO pull (tl.expectedreceiptdate); the carry-forward is
+        # belt-and-braces for a row that arrives without one. Note the shipment's own
+        # expecteddeliverydate is never written here — service.stock_on_order() prefers it at
+        # READ time, so a booked container's ETA still wins over the line's planning date.
         prior = {l.ns_item_id: (l.ns_inbound_shipment, l.expected_date) for l in po.lines}
         for l in list(po.lines):
             db.delete(l)
