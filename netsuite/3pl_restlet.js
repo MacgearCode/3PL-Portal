@@ -110,39 +110,56 @@ define(['N/query', 'N/record'], function (query, record) {
       "WHERE t.type='ItemRcpt' AND i.class=" + Number(p.ns_class_id) + locClause(p, 'tl') +
       " AND tl.mainline='F' AND tl.taxline='F' AND t.trandate >= " + sinceExpr(p.since));
 
-    // po_tranid: the source PO's document number, shown in the portal's "PO" column. createdfrom
-    // is not selectable in SuiteQL, so walk previoustransactionlinelink (receipt = nextdoc) back
-    // to a PurchOrd. Null when the receipt came from something else (e.g. a transfer order).
+    // Two decorative columns on the portal's receipts view, both resolved from the receipt's
+    // source PO in ONE lookup:
+    //   po_tranid            — the source PO's document number. createdfrom is not selectable in
+    //                          SuiteQL, so walk previoustransactionlinelink (receipt = nextdoc)
+    //                          back to a PurchOrd. Null for a receipt from something else
+    //                          (e.g. a transfer order).
+    //   ns_inbound_shipment  — the container it arrived on. There is NO inboundshipment field on
+    //                          the receipt (transaction.inboundshipment does not exist), and no
+    //                          direct receipt->shipment link, so reach it through the PO:
+    //                          receipt -> PO -> inboundshipmentitem.purchaseordertransaction ->
+    //                          inboundshipment. VALIDATED against production 2026-07-27: all 9
+    //                          Mova 3PL receipts resolve 1:1 to INBSHIP91-99.
+    // The shipment joins are LEFT so a receipt whose PO isn't on a container still keeps its
+    // po_tranid. MIN() picks one deterministically if a PO ever spans multiple shipments (note
+    // it's a lexical MIN on the doc number, so INBSHIP100 would sort before INBSHIP97).
     //
-    // Fetched SEPARATELY and in a try/catch, on purpose. It used to be a correlated subquery in
-    // the SELECT list above, which made the *entire* receipts read all-or-nothing: any problem
-    // reaching previoustransactionlinelink (it's a system table a restricted integration role may
-    // not be able to read) lost all 9 receipts AND the whole putaway charge, to populate one
-    // cosmetic column. Now a failure blanks that column and nothing else. Scoped by receipt id —
-    // the same id-list pattern inboundShipments uses — so it stays cheap and can't pull in other
-    // subsidiaries' receipts.
-    var poByReceipt = {}, rcptIds = {};
+    // Fetched SEPARATELY and in a try/catch, on purpose. po_tranid used to be a correlated
+    // subquery in the SELECT list above, which made the *entire* receipts read all-or-nothing:
+    // any problem reaching previoustransactionlinelink lost all 9 receipts AND the whole putaway
+    // charge, to populate one cosmetic column. Now a failure blanks these two columns and nothing
+    // else. Scoped by receipt id — the same id-list pattern inboundShipments uses — so it stays
+    // cheap and can't pull in other subsidiaries' receipts.
+    var extra = {}, warn = null, rcptIds = {};
     flat.forEach(function (r) { rcptIds[String(r.id)] = true; });
     var idList = Object.keys(rcptIds);
     if (idList.length) {
       try {
         runSuiteQL(
-          "SELECT ptll.nextdoc receipt, MIN(po.tranid) po_tranid " +
+          "SELECT ptll.nextdoc receipt, MIN(po.tranid) po_tranid, MIN(s.shipmentnumber) shipment " +
           "FROM previoustransactionlinelink ptll " +
           "JOIN transaction po ON po.id=ptll.previousdoc " +
+          "LEFT JOIN inboundshipmentitem isi ON isi.purchaseordertransaction=po.id " +
+          "LEFT JOIN inboundshipment s ON s.id=isi.inboundshipment " +
           "WHERE po.type='PurchOrd' AND ptll.nextdoc IN (" + idList.join(',') + ") " +
           "GROUP BY ptll.nextdoc"
-        ).forEach(function (r) { poByReceipt[String(r.receipt)] = r.po_tranid || null; });
+        ).forEach(function (r) {
+          extra[String(r.receipt)] = { po: r.po_tranid || null, ship: r.shipment || null };
+        });
       } catch (e) {
-        // Leave the PO column blank rather than losing the receipts. Surfaced on the response so
+        // Leave both columns blank rather than losing the receipts. Surfaced on the response so
         // it doesn't fail silently — n8n logs the whole payload.
-        poByReceipt.__error = (e && e.message) || String(e);
+        warn = (e && e.message) || String(e);
       }
     }
-    var warn = poByReceipt.__error || null;
     var out = group(flat, 'id',
-      function (r) { return { ns_receipt_id: String(r.id), tranid: r.tranid, trandate: r.trandate,
-                              po_tranid: poByReceipt[String(r.id)] || null }; },
+      function (r) {
+        var x = extra[String(r.id)] || {};
+        return { ns_receipt_id: String(r.id), tranid: r.tranid, trandate: r.trandate,
+                 po_tranid: x.po || null, ns_inbound_shipment: x.ship || null };
+      },
       function (r) { return { ns_item_id: String(r.item), qty: r.quantity }; });
     if (warn && out.length) out[0].po_lookup_warning = warn;   // ignored by the app's ingest
     return out;

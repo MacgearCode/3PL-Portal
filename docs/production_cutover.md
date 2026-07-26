@@ -379,7 +379,49 @@ accumulate. If you want this first week pro-rated, bill it manually or run the p
 
 ---
 
-## 7. Known cosmetic gaps (not blockers)
+## 7. ⚠️ A missing transaction permission looks exactly like "no data yet"
+
+**Hit for real on 2026-07-27.** The Item receipts view was empty (sidebar badge `0`) while Stock on
+hand and Stock on order were perfect — and **nothing appeared in the n8n error log**.
+
+Cause: the integration role was missing **Transactions → Item Receipt**. NetSuite does not raise an
+error for that. It applies row-level filtering and returns an **empty result set from a successful
+query**, so the sync reports a clean run that ingested zero rows.
+
+This is the second silent-zero-rows failure mode in this integration (subsidiary access, §3.3, is
+the other). Both are dangerous specifically because billing is driven off these reads: a silently
+empty `item_receipts` costs the entire putaway charge ($6,369 in week one), and a silently empty
+`inbound_shipments` costs the container-unload charge ($13,500).
+
+**How to tell it apart from a genuine failure.** In the n8n execution output the ingest endpoint
+echoes a count:
+```json
+{"customer":"mova","entity":"item_receipts","ingested":0}
+```
+- `ingested: 0` **with no** `{step:"read", level:"error", …}` item → the query succeeded and returned
+  nothing → **permission filtering** (or subsidiary access). Fix the role, not the code.
+- an `error` item → a genuine query/permission exception, message included.
+
+**Per-view → permission it needs.** Grant all of these up front; each one silently empties its view:
+
+| Empty view | Missing permission |
+|---|---|
+| Item receipts | Transactions → **Item Receipt** (View) |
+| Fulfilments | Transactions → **Item Fulfilment** (View) — *and* Sales Order |
+| Stock on order | Transactions → **Purchase Order** (View) |
+| Inbound shipment column / container-unload charge | Lists → **Inbound Shipment** (View) |
+| Invoices | Transactions → **Invoice** (Create, which implies view) |
+| Stock on hand | Lists → Items + Inventory |
+
+Role changes take effect immediately — **no RESTlet redeploy**, just re-run the full lane.
+
+**Rule of thumb:** any view that is empty while others populate, with a clean n8n run, is a role
+permission — not a bug, not missing data. Check the badge counts against §5 before trusting a
+billing preview.
+
+---
+
+## 8. Known cosmetic gaps (not blockers)
 
 - **`expecteddeliverydate` is NULL on all 12 production inbound shipments.** The Expected Receipt
   column therefore comes from the PO line's `expectedreceiptdate` — which is exactly why the

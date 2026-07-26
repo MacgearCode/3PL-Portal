@@ -9,6 +9,22 @@ until Mova items/transactions exist (~end Jul 2026).
   "REST Web Services" feature) — discover fields with `SELECT *` / `SELECT` probes instead.
 - `BUILTIN.DF(col)` resolves an internal id to its display label — use freely in SELECT.
 - **`createdfrom` is NOT selectable** in SuiteQL here (throws "unexpected SuiteScript error"). Do not use it.
+- **There is no receipt → inbound-shipment field.** `transaction.inboundshipment` does not exist
+  ("Unknown identifier"), and there's no direct link. Reach it through the source PO
+  (validated production 2026-07-27, all 9 Mova 3PL receipts resolved 1:1 to `INBSHIP91`–`99`):
+  ```sql
+  SELECT ptll.nextdoc receipt, MIN(po.tranid) po_tranid, MIN(s.shipmentnumber) shipment
+  FROM previoustransactionlinelink ptll
+  JOIN transaction po ON po.id = ptll.previousdoc
+  LEFT JOIN inboundshipmentitem isi ON isi.purchaseordertransaction = po.id
+  LEFT JOIN inboundshipment s ON s.id = isi.inboundshipment
+  WHERE po.type='PurchOrd' AND ptll.nextdoc IN (:receipt_ids)
+  GROUP BY ptll.nextdoc
+  ```
+  Keep the shipment joins **LEFT** so a receipt whose PO isn't on a container still returns its
+  `po_tranid`. Run it as its own id-scoped query, **not** as a correlated subquery in the receipts
+  SELECT list — as a subquery it makes the whole receipts read (and the putaway charge with it)
+  all-or-nothing on two cosmetic columns.
 - Transient `HTTP 502 Bad gateway` happens — just retry after a moment.
 - `SELECT *` is supported on `item`; `WITH`/CTEs are not; string concat is `||`; dates via `TO_DATE`.
 
