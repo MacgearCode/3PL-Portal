@@ -188,8 +188,12 @@ define(['N/query', 'N/record'], function (query, record) {
     // all, so that column has always been blank for every customer.
     // createdfrom is not selectable in SuiteQL, so walk previoustransactionlinelink the same way
     // itemReceipts does (fulfilment = nextdoc, source = previousdoc). Deliberately NO filter on
-    // the source transaction type: a fulfilment's previous doc IS its source order, whether that
-    // is a SalesOrd or a vendor authorisation, so this can't be wrong about which type a VRMA is.
+    // the source transaction type: a fulfilment's previous doc IS its source order, whichever
+    // type that is. VALIDATED against production 2026-07-27 — all 27 Skriva fulfilments resolved
+    // to their SO ('SalesOrd' -> SO328496 etc.), and vendor-entity fulfilments resolve to
+    // 'VendAuth' -> VRMA000327 etc. A guessed type filter (e.g. 'RtnAuth') would have silently
+    // returned nothing for every VRMA — which is Mova's DEFAULT dispatch path.
+    // GROUP BY + MIN() is required, not cosmetic: a fulfilment has one link row per line.
     // Separate, id-scoped and try/catch'd for the same reason as the receipts lookup — this is a
     // cosmetic column and must never be able to take the fulfilments (and the picking charge)
     // down with it.

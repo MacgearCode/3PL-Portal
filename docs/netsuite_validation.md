@@ -9,6 +9,21 @@ until Mova items/transactions exist (~end Jul 2026).
   "REST Web Services" feature) — discover fields with `SELECT *` / `SELECT` probes instead.
 - `BUILTIN.DF(col)` resolves an internal id to its display label — use freely in SELECT.
 - **`createdfrom` is NOT selectable** in SuiteQL here (throws "unexpected SuiteScript error"). Do not use it.
+- **Fulfilment → source document (the portal's "Reference" column).** `createdfrom` is not
+  selectable, so walk `previoustransactionlinelink` (fulfilment = `nextdoc`). Validated production
+  2026-07-27: **27/27 Skriva fulfilments** resolved to their sales order (`SalesOrd` → `SO328496`…),
+  and vendor-entity fulfilments resolve to `VendAuth` → `VRMA000327`…
+  ```sql
+  SELECT ptll.nextdoc ff, MIN(src.tranid) ref
+  FROM previoustransactionlinelink ptll
+  JOIN transaction src ON src.id = ptll.previousdoc
+  WHERE ptll.nextdoc IN (:fulfilment_ids)
+  GROUP BY ptll.nextdoc
+  ```
+  **Do not filter on `src.type`** — the previous doc is the source order whichever type it is, and
+  guessing wrong (e.g. `RtnAuth` instead of `VendAuth`) silently returns nothing for every VRMA,
+  which is Mova's default dispatch path. `GROUP BY` + `MIN()` is required: there is one link row
+  per fulfilment line.
 - **There is no receipt → inbound-shipment field.** `transaction.inboundshipment` does not exist
   ("Unknown identifier"), and there's no direct link. Reach it through the source PO
   (validated production 2026-07-27, all 9 Mova 3PL receipts resolved 1:1 to `INBSHIP91`–`99`):
