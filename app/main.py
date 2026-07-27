@@ -378,7 +378,7 @@ def portal_export(slug: str, view: str, request: Request, db: Session = Depends(
         "item_receipts": [("Receipt", "tranid"), ("PO", "po"), ("Inbound shipment", "shipment"),
                           ("SKU", "sku"), ("Description", "name"), ("Qty", "qty"),
                           ("Date", "trandate")],
-        "fulfilments": [("Fulfilment", "tranid"), ("Type", "source"), ("Source", "ref"),
+        "fulfilments": [("Fulfilment", "tranid"), ("Type", "source"), ("Reference", "ref"),
                         ("SKU", "sku"), ("Qty", "qty"), ("Date", "trandate")],
         "invoices": [("Invoice", "tranid"), ("Date", "trandate"), ("Amount", "total"),
                      ("Status", "status")],

@@ -182,10 +182,42 @@ define(['N/query', 'N/record'], function (query, record) {
       "AND tl.accountinglinetype='ASSET' AND tl.quantity IS NOT NULL AND tl.quantity <> 0 " +
       "AND t.trandate >= " + sinceExpr(p.since));
     var custId = String(p.ns_customer_id);
-    return group(flat, 'id',
+
+    // ns_source_id: the ORIGINATING document number (the $0 sales order, or the VRMA) that this
+    // fulfilment was created from — the portal's "Reference" column. It was never returned at
+    // all, so that column has always been blank for every customer.
+    // createdfrom is not selectable in SuiteQL, so walk previoustransactionlinelink the same way
+    // itemReceipts does (fulfilment = nextdoc, source = previousdoc). Deliberately NO filter on
+    // the source transaction type: a fulfilment's previous doc IS its source order, whether that
+    // is a SalesOrd or a vendor authorisation, so this can't be wrong about which type a VRMA is.
+    // Separate, id-scoped and try/catch'd for the same reason as the receipts lookup — this is a
+    // cosmetic column and must never be able to take the fulfilments (and the picking charge)
+    // down with it.
+    var refById = {};
+    var ffIds = {};
+    flat.forEach(function (r) { ffIds[String(r.id)] = true; });
+    var ffList = Object.keys(ffIds);
+    if (ffList.length) {
+      try {
+        runSuiteQL(
+          "SELECT ptll.nextdoc ff, MIN(src.tranid) ref " +
+          "FROM previoustransactionlinelink ptll " +
+          "JOIN transaction src ON src.id=ptll.previousdoc " +
+          "WHERE ptll.nextdoc IN (" + ffList.join(',') + ") " +
+          "GROUP BY ptll.nextdoc"
+        ).forEach(function (r) { refById[String(r.ff)] = r.ref || null; });
+      } catch (e) {
+        refById.__error = (e && e.message) || String(e);
+      }
+    }
+    var refWarn = refById.__error || null;
+    var ffOut = group(flat, 'id',
       function (r) { return { ns_fulfilment_id: String(r.id), tranid: r.tranid, trandate: r.trandate,
-                              source_type: String(r.entity) === custId ? 'SO' : 'VRMA' }; },
+                              source_type: String(r.entity) === custId ? 'SO' : 'VRMA',
+                              ns_source_id: refById[String(r.id)] || null }; },
       function (r) { return { ns_item_id: String(r.item), qty: r.qty }; });
+    if (refWarn && ffOut.length) ffOut[0].source_lookup_warning = refWarn;
+    return ffOut;
   }
 
   function stockOnHand(p) {

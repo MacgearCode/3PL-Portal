@@ -266,7 +266,10 @@
       <div class="card"><header><h3>Fulfilments</h3><span class="hint">sales orders + VRMA transfers · drives per-unit pick fee</span></header>
         {{ pagedtools('fulfilment line') }}
         <div class="tablewrap"><table id="tbl-ful">
-          <thead><tr><th>Fulfilment</th><th>Type</th><th>Source</th><th>Item</th><th class="r">Qty</th><th>Date</th></tr></thead>
+          {# "Reference" = the originating SO/VRMA document number (as in prototype/portal.html).
+             It was briefly headed "Source", which sitting next to the SO/VRMA "Type" pill read
+             as though it should hold the pill itself. #}
+          <thead><tr><th>Fulfilment</th><th>Type</th><th>Reference</th><th>Item</th><th class="r">Qty</th><th>Date</th></tr></thead>
           <tbody>{{ R.fulfilment_rows(rows) }}
           {% if not rows %}<tr><td class="empty" colspan="6">{{ 'No fulfilments match that search.' if q else 'No fulfilments in this period.' }}</td></tr>{% endif %}</tbody>
           {% if rows %}<tfoot><tr><td colspan="4">{{ docs|qty }} fulfilments · {{ total|qty }} lines</td><td class="r">{{ qty_total|qty }}</td><td></td></tr></tfoot>{% endif %}
