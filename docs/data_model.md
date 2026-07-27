@@ -1,8 +1,19 @@
-# 3PL Portal — Data Model & NetSuite Sync Spec (v0)
+# 3PL Portal — Data Model & NetSuite Sync Spec (v1)
 
-> **Status: v0 — drafted from the brief, NOT yet validated against live NetSuite.**
-> Field/record names below are best-guess. Once the NetSuite MCP is connected we validate every
-> SuiteQL query against live **Skriva** data and correct names here, then promote to v1.
+> **Status: v1 — validated and LIVE on NetSuite production since 2026-07-27.**
+> Every SuiteQL query behind this model has been run against live data; the authoritative,
+> validated queries and field names live in **`docs/netsuite_validation.md`** — treat that as the
+> source of truth over any prose here. The shipped schema is `db/01_schema.sql` plus the
+> `ensure_columns()` migrations in `app/db.py` (columns added after v1: `stock_on_hand.synced_at`,
+> `item_receipt.po_tranid`, `po_line.ns_inbound_shipment`, `inbound_shipment.expected_date`,
+> `inbound_shipment.container_no`, `customer.location_scoped`, and the `app_user` reset columns).
+>
+> Two model facts that were open questions in v0 and are now settled:
+> - **Stock isolation is per-customer**, via `customer.location_scoped` — brand class alone for
+>   Skriva, class **AND** the 3PL location for Mova (whose brand also covers Macgear-owned stock).
+> - **Dates come from the PO line** (`expectedreceiptdate`); the inbound shipment's
+>   `expecteddeliverydate` is NULL on every production shipment, so it is only an override, never
+>   the primary source.
 
 ## Design principles
 
@@ -28,7 +39,11 @@
 The cache must isolate a customer's stock by **(location AND/OR brand)**, because Skriva proves you can't
 rely on a dedicated location alone. So `customer` carries **both** an optional `netsuite_location_id` and a
 `brand_tag`, and the sync filter for each customer is `location = X` **and/or** `brand = Y` — whichever
-uniquely identifies that customer's 3PL stock. **(Validate the exact filter per customer in NetSuite.)**
+uniquely identifies that customer's 3PL stock. **Settled:** the flag is `customer.location_scoped`
+— `True` for Mova (class `237` **and** location `49`), `False` for Skriva (class `236` only, since
+its stock legitimately spans Auckland + Christchurch). The RESTlet's `locClause()` applies the
+location filter only when the flag is set, and the flag travels via `/admin/sync-config`, so
+onboarding a customer needs no n8n edit.
 
 ## The 6 visibility views → source mapping
 

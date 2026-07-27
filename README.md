@@ -4,8 +4,18 @@ Customer visibility portal + weekly billing automation for Macgear's 3PL service
 (receive / store / dispatch stock Macgear doesn't own, charge handling & storage fees).
 NetSuite-backed, multi-tenant. First customer: **Mova**. Reference: **Skriva**.
 
-See `CLAUDE.md` for the business brief, `docs/data_model.md` for the schema/sync design,
-and `docs/netsuite_validation.md` for the **validated** SuiteQL the sync layer uses.
+**Status: LIVE on NetSuite production since 2026-07-27** — all 6 visibility views are syncing real
+data. The billing write path (auto-generated draft invoice → manual push) is the remaining work;
+see the *Billing roadmap* in `CLAUDE.md`.
+
+| Doc | What's in it |
+|---|---|
+| `CLAUDE.md` | business brief, current status, billing roadmap, UI/brand, hard-won NetSuite gotchas |
+| `docs/netsuite_validation.md` | the **validated** SuiteQL — source of truth for field names and joins |
+| `docs/netsuite_integration.md` | n8n + RESTlet architecture and endpoint contracts |
+| `docs/production_cutover.md` | the production cutover record: verified ids, TBA/role setup, cache purge, what went wrong |
+| `docs/data_model.md` | schema + sync design (v1) |
+| `docs/deploy.md` | droplet + sandbox deploy walkthrough |
 
 ## Run locally
 ```powershell
@@ -36,6 +46,8 @@ app/
   notify.py      send_reset_email: POSTs the reset link to an n8n webhook (or logs it locally)
   seed.py        seeds Mova/Skriva + rate cards + users (+ demo cache unless SEED_DEMO=0)
   templates/ static/   server-rendered portal UI
+                 _rows.html = table-row macros shared by the full page and the Load more
+                 fetch (_rows_partial.html), so row markup exists once
 db/01_schema.sql  canonical Postgres DDL (v1, validated columns)
 netsuite/      3pl_restlet.js (deployed in NetSuite) + n8n_3pl_sync.js (n8n Code node)
 ```

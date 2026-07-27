@@ -1,5 +1,9 @@
 # NetSuite integration — live architecture
 
+> **LIVE on the NetSuite production account since 2026-07-27.** Reads are running on both lanes;
+> the billing write path is not yet configured (see the *Billing roadmap* in `CLAUDE.md`).
+> Cutover record + verified ids: `production_cutover.md`.
+
 **The droplet app never talks to NetSuite.** It holds no NetSuite credentials and makes no
 outbound NetSuite calls. There is **no AI and no MCP** anywhere in the runtime. All NetSuite
 communication is server-to-server between **n8n** (which signs Token-Based Auth) and a
@@ -25,8 +29,15 @@ communication is server-to-server between **n8n** (which signs Token-Based Auth)
   `/admin/ingest`; then drains `/admin/billing/pending`, creates each draft invoice, posts the id back.
 - **App endpoints** (token-authed via `X-Sync-Token: $SYNC_TOKEN`):
   - `POST /admin/ingest` — `{customer: slug, entity, rows[]}` → upsert (see `app/netsuite.py` for row contracts).
+    Responds `{customer, entity, ingested: N}` — **`ingested: 0` with no error item in the n8n run
+    means the SuiteQL succeeded and returned nothing**, i.e. a role permission or subsidiary-access
+    problem, not a code bug. See `production_cutover.md` §7.
   - `GET  /admin/billing/pending` — billing runs queued (`ready_to_push`) with lines + customer ns ids.
   - `POST /admin/billing/pushed` — `{run_id, ns_invoice_id}` → marks the run pushed and links the invoice.
+- **Portal-internal routes** (session-authed, not for n8n), added with the paged list views:
+  `GET /c/{slug}/{view}/rows` returns bare `<tr>`s for the Load more button;
+  `GET /c/{slug}/{view}/export.csv` streams the whole current selection. Both enforce the same
+  customer scoping as the page.
 
 ## Invoice lifecycle (why reads are authoritative)
 Queue a run → n8n creates a **draft** invoice in NetSuite → a person approves/edits it there →

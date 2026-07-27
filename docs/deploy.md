@@ -1,5 +1,10 @@
 # Deploy to the droplet — sandbox first, then production
 
+> **Production went live 2026-07-27.** For the production account specifically — verified internal
+> ids, the TBA/integration/role/token setup, the cache purge, and the failure modes actually hit —
+> use **`production_cutover.md`**, which is the record of what was done. This document remains the
+> general/sandbox walkthrough and the starting point for a fresh environment.
+
 The app never calls NetSuite (see `netsuite_integration.md`). Deploying is therefore just:
 ship the web app, deploy the RESTlet in NetSuite, point the n8n Code node at it. Do it all
 against the **NetSuite sandbox** first, then flip a handful of constants to go to production.
@@ -8,8 +13,10 @@ against the **NetSuite sandbox** first, then flip a handful of constants to go t
 - **Skriva** is live in the sandbox (customer `10496`, vendor `10503`, location `2`, class `236`)
   — this is your real end-to-end sync test. Internal ids usually match prod in a refresh copy,
   but confirm them in the sandbox UI before trusting them.
-- **Mova does not exist in NetSuite yet** (stock expected end of July 2026). Its `ns_customer_id`
-  /`ns_supplier_id` are `TBD` in the seed. So sandbox testing = Skriva only until Mova is created.
+- **Mova is live in production as of 2026-07-27** (stock landed 24 Jul: 9 containers / 6,369 units).
+  Supplier `10872`, class `237`, location `49`, subsidiary `2` — see `production_cutover.md` §0.
+  Its `ns_customer_id` is still **undecided** (no Mova record is a 3PL billing entity), which is
+  why the draft-invoice push is not yet configured. The seed still ships `TBD` for both ids.
 - The service items in `CHARGE_ITEMS` (container_unload, putaway, storage, picking_so, picking_vrma)
   must exist in the sandbox for `create_invoice` to work. Skriva's rate card is seeded at $0, so a
   Skriva billing run produces a $0 draft — perfect for proving the push loop without real charges.

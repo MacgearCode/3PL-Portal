@@ -2,13 +2,36 @@
 
 A customer-facing visibility portal + billing automation for Macgear's new **3PL (third-party logistics) service**. Macgear receives, stores, and dispatches stock it does **not** own, on behalf of customers, and charges handling/storage fees. Everything runs through **NetSuite**.
 
-## Status
-Real app scaffolded and running locally (`./run.ps1`). NetSuite data access **validated** against
-live Skriva data (`docs/netsuite_validation.md`) — all 6 views + 5 billing charges proven in SuiteQL.
-Postgres schema is v1 (`db/01_schema.sql`). Billing engine implemented & verified (June demo run =
-$16,765, math checks out). NetSuite integration refactored to **n8n + RESTlet** (app never calls NS).
-**Only remaining go-live step:** deploy the RESTlet + n8n node and set creds/`SYNC_TOKEN` (see
-`docs/netsuite_integration.md`) — all app-side code is done. First customer (Mova) stock expected **end of July 2026**.
+## Status — ✅ LIVE on NetSuite **production** (2026-07-27)
+The RESTlet is deployed in the production account, the n8n lanes are wired, and a **full sync has
+run successfully**. All 6 visibility views are populated with real Mova 3PL data and verified
+against NetSuite. Postgres schema is v1 (`db/01_schema.sql`) + `ensure_columns()` migrations.
+The cutover record — verified prod ids, TBA/role setup, the cache purge, and the traps that were
+actually hit — is `docs/production_cutover.md`.
+
+**First production data (Mova, week of 20–26 Jul 2026):** 5 SKUs / 6,369 units / 533 pallets on
+hand, 9 receipts (6,369 units) off 9 containers, 12 inbound shipments (`INBSHIP91`–`102`, 9
+received / 3 in transit), 4 open PO lines (2,145 units, ETA 28/08). No dispatches yet.
+
+**Remaining work: the billing write path** — see *Billing roadmap* below. Reads are done; the
+draft-invoice push is not yet configured (needs the 3PL billing customer record + `CHARGE_ITEMS`
+mapped to production items, `docs/production_cutover.md` §1). "Queue for NetSuite" will error
+until those land. Skriva remains live as the reference customer.
+
+## Billing roadmap (agreed 2026-07-27 — NOT yet built)
+Target shape: **lock the period → auto-generate the draft at period end → review/edit → manual
+push to NetSuite.** Nothing should ever post automatically.
+
+| Piece | State |
+|---|---|
+| Manual push only ("Queue for NetSuite" → n8n → **draft** invoice, approved by a human in NS) | ✅ already how it works — no auto-post exists |
+| One run per period (`billing_run` unique on customer+period) | ✅ built |
+| Re-billing guard — a period at `ready_to_push`/`pushed`/`invoiced` can't be re-saved or re-queued | ✅ built (partial period lock) |
+| **Explicit period lock/close** — a *draft* run can still be recomputed today; there's no "close this period" action | ❌ to build |
+| **Auto-generate the draft at period end** — today a human opens Billing run, picks dates, Preview → Save | ❌ to build (n8n schedule → a new endpoint, mirroring the existing sync lanes) |
+| **Edit the draft before pushing** | ⚠️ **decide first:** lines are editable in *NetSuite* after the draft is created (works today). Editing the computed lines *in the portal* before push — adjusting a qty, adding an ad-hoc charge — is a different, larger feature. Confirm which is wanted. |
+
+Statuses today: `draft → ready_to_push → pushed → invoiced`.
 
 ## Build (the real app, in `app/`)
 FastAPI + SQLAlchemy, `DATABASE_URL` (SQLite local / Postgres droplet). `app/main.py` (auth, customer
@@ -91,7 +114,15 @@ unset = link only shown in the UI + logged to console. `/forgot` never reveals w
 Seeded logins (dev — CHANGE): admin@macgeargroup.com/admin123,
 ops@macgeargroup.com/internal123, viewer@mova.com/mova123. Auth is always on now (no shared-password mode).
 
-## Validated NetSuite facts (2026-06-26)
+## Validated NetSuite facts (2026-06-26, re-confirmed against **production** 2026-07-27)
+**Production ids in use** (all read out of the live account, not assumed): account `840974`,
+subsidiary `2` (MacGear AU), Mova class `237` @ location `49` (`AU2 – Melbourne Warehouse :
+warehouse 3PL`), Mova vendor/supplier **`10872`** = "Mova Technologies (AU) **($AUD)**" — note
+`10504` is the **$USD** entity and `10688` is NZ, easy to grab by mistake. Units-per-pallet field
+is `custitem_pallet_quantity` (`custitem_pallet_layer_quantity` is a *different*, per-layer field).
+Mova's **3PL billing customer record is still undecided** — none of the four Mova customers
+(`10501` AU Online, `10502` NZ Online, `10567`/`10859` DOA replacements) is a 3PL billing entity.
+
 Brand = NetSuite **classification** (store class id, not text). Mova uses its **regular MOVA brand** —
 class `237` (MOVA) @ location `49` (warehouse 3PL); Skriva class `236` @ location `2` (Auckland).
 **Model change (2026-07-22):** dropped the dedicated `3PL - Mova` brand (`253`) and dedicated 3PL SKUs —
@@ -112,6 +143,19 @@ vendor); `createdfrom` is NOT selectable in SuiteQL. Open-PO test = `quantityshi
 Fulfilments: count units off the **ASSET line, ABS(qty)** (SO emits +COGS/−ASSET pair, VRMA emits a lone −ASSET line; old "sum positives" dropped every VRMA — corrected 2026-06-27). Skriva invoices are $0 product invoices, so the
 **service-charge invoice is greenfield**. `inboundshipment` table exists. REST metadata catalog is 403
 (permission); discover fields via `SELECT *`. Another 3PL customer already live (ClassVR) — multi-tenant confirmed.
+
+**⚠️ A missing transaction permission is indistinguishable from "no data yet."** NetSuite does not
+error when the integration role lacks a transaction permission — it row-filters and returns an
+**empty result set from a successful query**, so the sync logs a clean run that ingested 0 rows.
+Hit for real on go-live: Item receipts was empty while SOH and Stock-on-order were perfect, with
+nothing in the n8n error log. Cause was a missing **Transactions → Item Receipt** grant. Same
+applies to subsidiary access. Discriminator: `"ingested": 0` **with no** error item = fix the role,
+not the code. Per-view permission table in `docs/production_cutover.md` §7.
+
+**Cosmetic columns must never be able to fail a read.** Two views lost their whole dataset (and the
+charge derived from it) to an all-or-nothing lookup for a decorative column. Receipts' `po_tranid`
+was a correlated subquery in the SELECT list; both it and the fulfilment source lookup are now
+separate, id-scoped and `try/catch`'d, so a failure blanks one column instead of dropping every row.
 
 ## The business model
 - Macgear does **not** buy or own the stock — it transacts it and charges a fee for receiving, storing, dispatching.
@@ -159,6 +203,10 @@ Stock on order (open POs) · Item receipts · Stock on hand · Item fulfilments 
 
 ## Prototype
 `prototype/portal.html` — self-contained clickable SPA, dummy data, all 6 views + Overview dashboard + a "Billing run" view demonstrating the automation. Customer switcher toggles Mova / Skriva to show multi-tenancy. Published as a claude.ai Artifact. To iterate: edit the file and re-publish to the same URL.
+> ⚠️ **Historical artifact — the real app has moved past it.** It's still the old teal theme and has
+> none of the paged/windowed list views, the selectable overview chart, or the container/reference
+> columns. Use `app/` as the reference for how the portal actually looks and behaves; the prototype
+> is kept only as the original clickable pitch.
 
 ## NetSuite integration — n8n + RESTlet (app never calls NetSuite)
 **The droplet app holds no NetSuite credentials and makes no NetSuite calls. No AI/MCP at runtime**
@@ -166,7 +214,7 @@ Stock on order (open POs) · Item receipts · Stock on hand · Item fulfilments 
 (`netsuite/3pl_restlet.js`), same pattern as the vendor-credit-claims app. See `docs/netsuite_integration.md`.
 - **Reads:** n8n calls RESTlet (runs validated SuiteQL) → POSTs rows to token-authed `POST /admin/ingest`
   ({customer, entity, rows}); `app/netsuite.py` `ingest_*` upsert into the cache (invoices+lines, POs,
-  receipts, fulfilments, stock_on_hand; inbound_shipments TODO). NetSuite is source of truth — invoices
+  receipts, fulfilments, stock_on_hand, inbound_shipments). NetSuite is source of truth — invoices
   (status/edits/payments) come from the sync.
 - **Two sync lanes (mode-driven, same Code node):** FAST = `stock_on_hand` only every **15 min**
   (`mode:"soh"`, no writes) → portal SOH view is near-live ("● live · updated N min ago"). FULL = all 6

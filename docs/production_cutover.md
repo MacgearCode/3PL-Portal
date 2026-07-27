@@ -1,8 +1,29 @@
 # Production cutover — sandbox → NetSuite production
 
+> ## ✅ EXECUTED 2026-07-27 — the read path is LIVE
+> RESTlet deployed to production, n8n repointed, cache purged, full sync run. All 6 visibility
+> views are populated with real Mova 3PL data and reconcile against NetSuite.
+> **Still open:** the billing write path (§1a customer record, §1b `CHARGE_ITEMS`) — "Queue for
+> NetSuite" errors until those land. See the *Billing roadmap* in `CLAUDE.md`.
+>
+> **What actually bit, in order:**
+> 1. **Item receipts came back empty with no error.** The integration role was missing
+>    *Transactions → Item Receipt*; NetSuite row-filters silently rather than failing (§7). Cost a
+>    wasted RESTlet redeploy chasing a code-level theory first. **Check §7's permission table
+>    before debugging anything.**
+> 2. **Expected receipt was blank** — the RESTlet never selected `tl.expectedreceiptdate`, so the
+>    Incoming chart had nothing to plot. Fixed and redeployed.
+> 3. **Two columns could never populate** — the receipts' inbound shipment and the fulfilments'
+>    source document were simply never returned by the RESTlet. Both added.
+> 4. `expecteddeliverydate` is **NULL on all 12 production shipments**, so the PO line's
+>    `expectedreceiptdate` is the only working ETA — which is exactly why fix 2 mattered.
+>
+> Retain this document: it is the record of the verified production ids and the setup, and the
+> template for onboarding the next 3PL customer.
+
 Companion to `deploy.md` (which covers the sandbox build). This is the **flip to production**:
 what to change, what to verify first, and the two things that will silently corrupt billing if
-skipped. Everything below was verified against **live production** on 2026-07-26 via SuiteQL.
+skipped. Everything below was verified against **live production** on 2026-07-26/27 via SuiteQL.
 
 ---
 

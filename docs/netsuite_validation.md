@@ -1,8 +1,9 @@
-# NetSuite Validation — proven against live data (2026-06-26)
+# NetSuite Validation — proven against live data (2026-06-26 … 2026-07-27)
 
-All queries below were **run successfully against the live NetSuite account** via SuiteQL (Skriva
-reference customer). This is the de-risked basis for the sync layer. Mova-specific ids are marked TODO
-until Mova items/transactions exist (~end Jul 2026).
+All queries below were **run successfully against the live NetSuite account** via SuiteQL. Originally
+proven on the Skriva reference customer; **re-confirmed against real Mova 3PL data in production on
+2026-07-27**, when the sync went live. This file is the **source of truth for field names and joins**
+— prefer it over prose in the other docs.
 
 ## Access notes
 - `ns_runCustomSuiteQL` works. The **metadata catalog endpoint is permission-blocked** (HTTP 403,
@@ -72,9 +73,10 @@ until Mova items/transactions exist (~end Jul 2026).
 
 ## Item record fields (from `SELECT * FROM item WHERE id=50101`)
 - `class` = brand (236). `subsidiary`, `totalquantityonhand` present on the item.
-- **Units-per-pallet candidate: `custitem_pallet_quantity`** (null on Skriva — Skriva isn't palletised).
-  Also `custitem_pallet_layer_quantity` and `custitem_mcg_item_master_qty` (="120", master carton qty).
-  **TODO: confirm which field Mova populates** once Mova items exist; the brief says units/pallet is set on Mova items.
+- **Units-per-pallet = `custitem_pallet_quantity`** — ✅ CONFIRMED 2026-07-27: populated (`12`) on all
+  5 Mova items on hand in the 3PL location. Null on Skriva, which isn't palletised.
+  **Not** `custitem_pallet_layer_quantity` (per *layer*) and not `custitem_mcg_item_master_qty`
+  (="120", master carton qty) — picking either of those silently mis-prices storage.
 
 ## Transaction taxonomy (validated)
 Customer (10496): `SalesOrd`, `ItemShip` (fulfilment), `CustInvc`. Vendor (10503): `PurchOrd`, `ItemRcpt`, `VendBill`.
@@ -183,12 +185,19 @@ date fields are 100% populated); in-transit shipments get null and aren't billed
 shipments with `received_date` in the period. Caveat: `lastmodifieddate` moves if a received shipment
 is later edited, and a partiallyReceived→received transition re-dates it — re-run affected periods.
 
-## Remaining TODO (need Mova data, ~end Jul 2026)
-1. Confirm Mova item `custitem_pallet_quantity` is the units/pallet field and is populated.
-2. ~~`inboundshipment` field names~~ **DONE (2026-06-30)** — validated against production; RESTlet
-   `inbound_shipments` query corrected. Still worth a final smoke-test against the first real **Mova**
-   shipment once one exists (class `237` MOVA), as the queries were proven on the NANOLEAF brand.
-3. First real VRMA fulfilment to confirm the entity-based SO/VRMA discriminator on Mova.
-4. ~~Confirm Mova's exact class id~~ **RESOLVED (2026-07-22):** Mova uses its **regular MOVA brand `237`**
+## Open items (everything else is closed by the 2026-07-27 production go-live)
+1. ~~Confirm Mova's units/pallet field~~ **RESOLVED 2026-07-27** — `custitem_pallet_quantity` = 12 on
+   all 5 on-hand Mova items.
+2. ~~`inboundshipment` field names~~ **RESOLVED** — validated 2026-06-30, then re-confirmed against
+   real Mova shipments `INBSHIP91`–`102` on 2026-07-27 (class `237`, location `49`).
+3. ~~Confirm Mova's exact class id~~ **RESOLVED (2026-07-22):** Mova uses its **regular MOVA brand `237`**
    (305 items, regular SKUs). The dedicated `3PL - Mova` `253` brand and dedicated 3PL SKUs are dropped —
    3PL stock is isolated by `location = 49 AND class = 237`, the same shape as Skriva.
+4. **Still open — a real Mova VRMA fulfilment.** The entity-based SO/VRMA discriminator is validated
+   *generally* in production (vendor-entity fulfilments resolve to `VendAuth` source docs, e.g.
+   `VRMA000327`), but Mova has made **no dispatches at all yet**, so neither picking charge has ever
+   been exercised on Mova data. Worth a check on the first one — and note **VRMA is Mova's default
+   dispatch path**, so this is the common case, not the edge case.
+5. **Still open — the billing write path.** `create_invoice` has never run in production: the 3PL
+   billing customer record is undecided and `CHARGE_ITEMS` is unmapped (no container-unload item
+   exists in production). See `production_cutover.md` §1 and the *Billing roadmap* in `CLAUDE.md`.
