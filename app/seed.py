@@ -67,19 +67,19 @@ def _seed_mova_demo(db, mova):
     # in transit. The in-transit pair carries the outstanding PO stock + its expected
     # receipt date, and is what the "Incoming" chart series buckets by week.
     db.add_all([
-        InboundShipment(customer_id=mova.id, ns_shipment_id="IS5001",
+        InboundShipment(customer_id=mova.id, ns_shipment_id="IS5001", container_no="CSNU8516117",
                         shipment_number="ISMOV0001", container_type="40ft loose stacked",
                         expected_date=d(-21), received_date=d(-21), status="received"),
-        InboundShipment(customer_id=mova.id, ns_shipment_id="IS5002",
+        InboundShipment(customer_id=mova.id, ns_shipment_id="IS5002", container_no="OOCU7885472",
                         shipment_number="ISMOV0002", container_type="40ft loose stacked",
                         expected_date=d(-14), received_date=d(-13), status="received"),
-        InboundShipment(customer_id=mova.id, ns_shipment_id="IS5003",
+        InboundShipment(customer_id=mova.id, ns_shipment_id="IS5003", container_no="FCIU9725343",
                         shipment_number="ISMOV0003", container_type="40ft loose stacked",
                         expected_date=d(-7), received_date=d(-5), status="received"),
-        InboundShipment(customer_id=mova.id, ns_shipment_id="IS5004",
+        InboundShipment(customer_id=mova.id, ns_shipment_id="IS5004", container_no="COTU4966527",
                         shipment_number="ISMOV0004", container_type="40ft loose stacked",
                         expected_date=d(9), received_date=None, status="in transit"),
-        InboundShipment(customer_id=mova.id, ns_shipment_id="IS5005",
+        InboundShipment(customer_id=mova.id, ns_shipment_id="IS5005", container_no="COTU4966532",
                         shipment_number="ISMOV0005", container_type="40ft loose stacked",
                         expected_date=d(23), received_date=None, status="in transit"),
     ])
@@ -105,13 +105,16 @@ def _seed_mova_demo(db, mova):
 
     # Item receipts (putaway) — the three landed containers plus one this week. Quantities
     # tie back to the PO lines above (90001: 6000+3000=9000, 90002: 4000+1500=5500).
-    for ns_id, tranid, day, qty1, qty2 in [
-        ("IR8001", "IRAU020001", d(-21), 6000, 0),
-        ("IR8002", "IRAU020002", d(-13), 0, 4000),
-        ("IR8003", "IRAU020003", d(-5), 3000, 0),
-        ("IR8004", "IRAU020004", min(d(1), today), 0, 1500),
+    # ns_inbound_shipment carries the container through to the receipts view; the last one is
+    # deliberately unlinked so the "no container" case (—) is visible in the demo too.
+    for ns_id, tranid, day, ship, qty1, qty2 in [
+        ("IR8001", "IRAU020001", d(-21), "ISMOV0001", 6000, 0),
+        ("IR8002", "IRAU020002", d(-13), "ISMOV0002", 0, 4000),
+        ("IR8003", "IRAU020003", d(-5), "ISMOV0003", 3000, 0),
+        ("IR8004", "IRAU020004", min(d(1), today), None, 0, 1500),
     ]:
-        r = ItemReceipt(customer_id=mova.id, ns_receipt_id=ns_id, tranid=tranid, trandate=day)
+        r = ItemReceipt(customer_id=mova.id, ns_receipt_id=ns_id, tranid=tranid, trandate=day,
+                        ns_inbound_shipment=ship, po_tranid="POAU010001" if ship else None)
         db.add(r)
         db.flush()
         if qty1:

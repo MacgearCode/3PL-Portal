@@ -176,7 +176,7 @@ def ingest_item_fulfilments(db: Session, c: Customer, rows: list[dict]) -> int:
 
 
 def ingest_inbound_shipments(db: Session, c: Customer, rows: list[dict]) -> int:
-    """rows: [{ns_shipment_id, shipment_number, container_type, expected_date,
+    """rows: [{ns_shipment_id, shipment_number, container_type, container_no, expected_date,
               received_date, status, lines?:[{ns_item_id, po_tranid}]}]
 
     Member `lines` are optional and link the shipment back to the PO lines it contains, so the
@@ -188,6 +188,7 @@ def ingest_inbound_shipments(db: Session, c: Customer, rows: list[dict]) -> int:
         _upsert(db, InboundShipment, "ns_shipment_id", str(r["ns_shipment_id"]),
                 customer_id=c.id, shipment_number=r.get("shipment_number"),
                 container_type=r.get("container_type"),
+                container_no=r.get("container_no"),
                 expected_date=_date(r.get("expected_date")),
                 received_date=_date(r.get("received_date")), status=r.get("status"))
         num = r.get("shipment_number")

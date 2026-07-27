@@ -29,6 +29,13 @@ with OS-preference fallback. The sidebar and admin header are now **white in lig
 hardcoded dark teal in both). `prototype/portal.html` was deliberately **not** re-themed — it's still teal.
 Responsive: off-canvas nav drawer ≤860px; chart's segmented control drops to its own line ≤560px.
 
+**Container number** — `inboundshipment.externaldocumentnumber` (e.g. `CSNU8516117`), stored as
+`inbound_shipment.container_no` and shown on **Stock on order** and **Item receipts** (both also
+searchable/exportable by it). Distinct from `container_type`, which has no NetSuite field and is
+always null. Receipts reach it by outer-joining the shipment on `ns_inbound_shipment` inside the
+existing query, so the view stays at 2 queries. Needs `ensure_columns()` (verified against a
+pre-existing DB) + a RESTlet redeploy.
+
 **Paged list views (2026-07-27)** — Item receipts / Fulfilments / Invoices grow without bound
 (~470 receipts a year for Mova alone), so they're **date-windowed + paged**: default **last 30
 days**, selector `14d / 30d / 90d / This period / All`, **Load more** appends the next 100 rows via

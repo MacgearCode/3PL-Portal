@@ -113,7 +113,8 @@ class InboundShipment(Base):
     customer_id: Mapped[int] = mapped_column(ForeignKey("customer.id"))
     ns_shipment_id: Mapped[str] = mapped_column(String, unique=True)
     shipment_number: Mapped[str | None] = mapped_column(String, nullable=True)
-    container_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    container_type: Mapped[str | None] = mapped_column(String, nullable=True)  # "40ft loose stacked" — no NS field, always null
+    container_no: Mapped[str | None] = mapped_column(String, nullable=True)    # NS externaldocumentnumber, e.g. CSNU8516117
     expected_date: Mapped[date | None] = mapped_column(Date, nullable=True)  # expected receipt/delivery
     received_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     status: Mapped[str | None] = mapped_column(String, nullable=True)

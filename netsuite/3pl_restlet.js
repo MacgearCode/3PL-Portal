@@ -281,9 +281,13 @@ define(['N/query', 'N/record'], function (query, record) {
     });
     var idList = Object.keys(ids);
     if (!idList.length) return [];
+    // externaldocumentnumber = the CONTAINER number (e.g. CSNU8516117) — validated populated on
+    // all 12 live Mova shipments 2026-07-27. Distinct from container_type (the "40ft loose
+    // stacked" descriptor), which has no native field and stays null.
     var heads = runSuiteQL(
-      "SELECT id, shipmentnumber, expecteddeliverydate, actualdeliverydate, " +
-      "lastmodifieddate, shipmentstatus FROM inboundshipment WHERE id IN (" + idList.join(',') + ")");
+      "SELECT id, shipmentnumber, externaldocumentnumber, expecteddeliverydate, " +
+      "actualdeliverydate, lastmodifieddate, shipmentstatus " +
+      "FROM inboundshipment WHERE id IN (" + idList.join(',') + ")");
     // received_date drives the weekly container-unload charge (billing.py counts shipments
     // received in the period). VALIDATED 2026-06-30: actualdeliverydate is populated on only
     // ~3% of received shipments, so it's useless as the trigger. Instead a shipment counts as
@@ -298,6 +302,7 @@ define(['N/query', 'N/record'], function (query, record) {
       var isReceived = h.shipmentstatus === 'received' || h.shipmentstatus === 'partiallyReceived';
       return { ns_shipment_id: String(h.id), shipment_number: h.shipmentnumber,
                container_type: null,  // no native container-type field on inboundshipment
+               container_no: h.externaldocumentnumber || null,
                expected_date: h.expecteddeliverydate,
                received_date: isReceived ? (h.actualdeliverydate || h.lastmodifieddate) : null,
                status: STATUS[h.shipmentstatus] || h.shipmentstatus,

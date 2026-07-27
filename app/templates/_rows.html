@@ -5,6 +5,7 @@
 {%- macro receipt_rows(rows) -%}
 {%- for r in rows -%}
 <tr><td><span class="id">{{ r.tranid }}</span></td><td><span class="id">{{ r.po or '—' }}</span></td><td><span class="id">{{ r.shipment or '—' }}</span></td>
+  <td><span class="id">{{ r.container or '—' }}</span></td>
   <td><span class="id">{{ r.sku }}</span></td><td class="prim">{{ r.name }}</td><td class="r num">{{ r.qty|qty }}</td><td>{{ r.trandate|dshort }}</td></tr>
 {%- endfor -%}
 {%- endmacro -%}

@@ -78,6 +78,7 @@ def stock_on_order(db: Session, customer_id: int, imap: dict,
                         "received": float(l.qty_received or 0),
                         "outstanding": outstanding, "expected": expected,
                         "shipment": l.ns_inbound_shipment,
+                        "container": ship.container_no if ship else None,
                         "shipment_status": ship.status if ship else None})
     return out
 
@@ -139,25 +140,33 @@ def item_receipts(db: Session, customer_id: int, imap: dict, names: dict | None 
     if q:
         conds.append(_text_match(
             q, ItemReceiptLine.ns_item_id,
-            [ItemReceipt.tranid, ItemReceipt.po_tranid, ItemReceipt.ns_inbound_shipment],
+            [ItemReceipt.tranid, ItemReceipt.po_tranid, ItemReceipt.ns_inbound_shipment,
+             InboundShipment.container_no],
             imap, names))
+    # Outer-joined so the container number comes back in the same query (still 2 total) and a
+    # receipt not on a shipment is still listed. Matched on the shipment DOC number, which is
+    # what ingest_item_receipts stores on the receipt.
+    ship_on = ((InboundShipment.shipment_number == ItemReceipt.ns_inbound_shipment)
+               & (InboundShipment.customer_id == ItemReceipt.customer_id))
     join = (ItemReceiptLine.__table__
-            .join(ItemReceipt.__table__, ItemReceiptLine.item_receipt_id == ItemReceipt.id))
+            .join(ItemReceipt.__table__, ItemReceiptLine.item_receipt_id == ItemReceipt.id)
+            .outerjoin(InboundShipment.__table__, ship_on))
     agg = db.execute(
         select(func.count(), func.coalesce(func.sum(ItemReceiptLine.qty), 0),
                func.count(func.distinct(ItemReceipt.id)))
         .select_from(join).where(*conds)).one()
-    stmt = (select(ItemReceiptLine, ItemReceipt)
+    stmt = (select(ItemReceiptLine, ItemReceipt, InboundShipment.container_no)
             .join(ItemReceipt, ItemReceiptLine.item_receipt_id == ItemReceipt.id)
+            .outerjoin(InboundShipment, ship_on)
             .where(*conds)
             .order_by(ItemReceipt.trandate.desc(), ItemReceipt.id.desc(), ItemReceiptLine.id))
     if limit is not None:
         stmt = stmt.limit(limit).offset(offset)
     rows = [{"tranid": r.tranid, "trandate": r.trandate,
-             "shipment": r.ns_inbound_shipment, "po": r.po_tranid,
+             "shipment": r.ns_inbound_shipment, "container": container, "po": r.po_tranid,
              "sku": imap.get(l.ns_item_id, l.ns_item_id),
              "name": names.get(l.ns_item_id, ""), "qty": float(l.qty)}
-            for l, r in db.execute(stmt).all()]
+            for l, r, container in db.execute(stmt).all()]
     return {"rows": rows, "total": agg[0] or 0, "qty_total": float(agg[1] or 0),
             "docs": agg[2] or 0}
 

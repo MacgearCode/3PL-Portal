@@ -9,6 +9,11 @@ until Mova items/transactions exist (~end Jul 2026).
   "REST Web Services" feature) — discover fields with `SELECT *` / `SELECT` probes instead.
 - `BUILTIN.DF(col)` resolves an internal id to its display label — use freely in SELECT.
 - **`createdfrom` is NOT selectable** in SuiteQL here (throws "unexpected SuiteScript error"). Do not use it.
+- **Container number = `inboundshipment.externaldocumentnumber`.** Validated production
+  2026-07-27: populated on all 12 live Mova shipments with ISO container ids (`CSNU8516117`,
+  `OOCU7885472`, `COTU4966527`…). Not to be confused with `container_type` ("40ft loose stacked"),
+  which has **no** native field on `inboundshipment` and is always null. Surfaced on both Stock on
+  order (via the PO line's shipment) and Item receipts (via `ItemReceipt.ns_inbound_shipment`).
 - **Fulfilment → source document (the portal's "Reference" column).** `createdfrom` is not
   selectable, so walk `previoustransactionlinelink` (fulfilment = `nextdoc`). Validated production
   2026-07-27: **27/27 Skriva fulfilments** resolved to their sales order (`SalesOrd` → `SO328496`…),
