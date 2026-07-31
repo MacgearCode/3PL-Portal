@@ -411,10 +411,13 @@ def overview(db: Session, customer: Customer, imap: dict) -> dict:
     next_weeks = [week_bounds(anchor + timedelta(days=7 * i)) for i in range(4)]
 
     # current week charge breakdown + 4-week history, both from the billing engine
-    cur = compute_billing(db, customer, wk_start, wk_end)
+    # warn=False: the chart only reads totals, and the under-billing checks cost two extra
+    # queries per call — 10 pointless Postgres round trips a page load. The billing view, where
+    # the warnings actually matter, computes with them on.
+    cur = compute_billing(db, customer, wk_start, wk_end, warn=False)
     by_type = {l.charge_type: l for l in cur.lines}
     history = [{"label": s.strftime("%d %b"),
-                "total": compute_billing(db, customer, s, e).total}
+                "total": compute_billing(db, customer, s, e, warn=False).total}
                for s, e in past_weeks]
     received = received_per_week(db, customer.id, past_weeks)
     incoming, incoming_rest = incoming_per_week(soo, next_weeks)

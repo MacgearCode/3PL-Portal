@@ -60,7 +60,7 @@ onboarding a customer needs no n8n edit.
 
 | Charge | Rate (Mova) | Basis | Derived from |
 |---|---|---|---|
-| Container unload (40ft loose) | $1,500 | per container | count of `inbound_shipment` **received** in period |
+| Container unload (40ft loose) | $1,500 | per container | count of containers whose **earliest `item_receipt.trandate`** falls in the period, reached via `item_receipt.ns_inbound_shipment` (see below) |
 | Putaway | $1.00 | per unit | sum of `item_receipt_line.qty` in period |
 | Storage | $4.50 | per pallet/week | **avg daily pallets** over the period × weeks (`ceil(units_on_hand / units_per_pallet)` totalled per snapshot day, averaged) |
 | Picking — SO | $1.00 | per unit | sum of `item_fulfilment_line.qty` where source = SO |
@@ -74,6 +74,33 @@ onboarding a customer needs no n8n edit.
 > weekly reading and robust to how often we snapshot. With only one snapshot in the period it degrades
 > to "that reading held all week" (the original v0 weekly-snapshot behaviour). **Critical:** never *sum*
 > every snapshot — at daily/intraday cadence that overcharges ~7×.
+> **Corollary (2026-08-01):** if the period contains *no* snapshot at all — any week before the
+> sync started — storage computes to **$0** with nothing to show for it. `billing.py` now raises a
+> warning in that case rather than letting the charge vanish.
+
+> **Container unload is dated by the receipt, not the shipment (2026-08-01).** The obvious source —
+> `inbound_shipment.received_date` — is unusable. In production `actualdeliverydate` is NULL on all
+> 36 Mova shipments, so the RESTlet falls back to `lastmodifieddate`, which is whenever someone last
+> *touched* the record: the 9 containers unloaded 20 Jul carried 30 Jul, so the 20–26 Jul week billed
+> 0 containers and the next billed 22. The item receipt's `trandate` is the physical unload and does
+> not move when a record is edited, so the charge is **idempotent**.
+> Mechanics: `MIN(item_receipt.trandate)` grouped by `item_receipt.ns_inbound_shipment` over **all**
+> history, then count the shipments whose first-receipt date lands in the period. Grouping over all
+> history (not just the period) is what makes a container split across two receipts in different
+> weeks bill **once, in the earlier week** — never twice.
+> Cost of the approach: it makes `ns_inbound_shipment` billing-critical when the RESTlet treats it
+> as a best-effort column. That is covered by warnings, not by silence — see below.
+
+### Under-billing must be visible (`BillingResult.warnings`)
+
+A charge that computes to zero looks identical to "no activity". Three cases are therefore called
+out on the billing preview and echoed into the n8n log by `/admin/billing/generate`:
+
+| Warning | Means |
+|---|---|
+| receipts in the period with no container linked | the RESTlet's best-effort shipment lookup blanked; $1,500/container at risk |
+| containers marked received in NetSuite with no item receipt | not billable in **any** period until a receipt exists |
+| no SOH snapshot inside the period | storage silently uncharged for the week |
 
 ## Dispatch procedure (how stock leaves the 3PL)
 
@@ -115,4 +142,7 @@ the old "sum positives only" rule dropped VRMAs entirely.
 2. How "brand" is stored on the item (custom field id? `class`/`custitem_*`?) — drives the brand filter.
 3. Skriva's actual brand tag + whether its stock is isolable without a dedicated location.
 4. Units-per-pallet field id on the item record.
-5. Container = one inbound shipment? Confirm 1:1 so "per container" = count of inbound shipments.
+5. Container = one inbound shipment? **Confirmed 1:1 in production 2026-07-31** — each of the 22
+   received shipments has exactly one item receipt (verified through `previoustransactionlinelink`
+   on the shared PO line). The charge no longer assumes it, though: it counts distinct shipments
+   off their receipts, so a 2-receipt container is still one charge.

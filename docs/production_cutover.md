@@ -18,6 +18,17 @@
 > 4. `expecteddeliverydate` is **NULL on all 12 production shipments**, so the PO line's
 >    `expectedreceiptdate` is the only working ETA — which is exactly why fix 2 mattered.
 >
+> ### Follow-up, 2026-08-01
+> 5. **The container-unload charge was billing in the wrong week.** `actualdeliverydate` turns out
+>    to be NULL on **all 36** shipments (not just `expecteddeliverydate`), so the RESTlet's
+>    `lastmodifieddate` fallback always applied — and it's a bulk-edit timestamp, not a delivery.
+>    The 9 containers unloaded 20 Jul read as 30 Jul: **0 containers billed in the 20–26 Jul week,
+>    22 in the next.** The charge is now dated off the item receipt's `trandate`. Same root cause
+>    family as fix 4 — the `inboundshipment` header's dates are simply not populated in this
+>    account. Don't trust any of them for billing.
+> 6. **A stale sandbox invoice is still in the production cache** — §2a, targeted purge, ⏳ not yet
+>    run. `invoice` is upsert-only, so it will not clear itself.
+>
 > Retain this document: it is the record of the verified production ids and the setup, and the
 > template for onboarding the next 3PL customer.
 
@@ -86,10 +97,20 @@ then the invoice won't itemise it, and the portal's line detail won't match the 
 Recommend creating one non-inventory item, "3PL - Container Unload".
 
 ### c) Confirm the container-unload volume
-The first billing run will charge **9 containers × $1,500 = $13,500** (see §5). Nine inbound
-shipments were marked `received` on 24/07/2026 covering 6,369 units. Confirm that's nine physical
-container unloads and not one delivery split across nine shipment records — it's the largest line
-on the invoice by some margin.
+The first billing run will charge **9 containers × $1,500 = $13,500** (see §5), off receipts
+`IR023981`–`IR023989` dated **2026-07-20**, 6,369 units. Confirm that's nine physical container
+unloads and not one delivery split across nine shipment records — it's the largest line on the
+invoice by some margin. (The 1:1 shipment→receipt mapping *is* confirmed in the data; what only you
+can confirm is that nine records means nine physical unloads.)
+
+**A second batch has since landed:** 13 containers, receipts dated **2026-07-31**, 7,109 units →
+another **$19,500** in the 27 Jul–2 Aug week. Same question applies.
+
+### d) Populate `custitem_pallet_quantity` on three SKUs
+`52856` / `52857` / `52858` (`20010100002916`, `20010100003083`, `20010100003085`) have the field
+**NULL**, with 8,000 units on order between them. Storage is `ceil(units ÷ units_per_pallet)`, so a
+NULL contributes **0 pallets** — those units would be stored free. They hold no stock yet, so fix
+it in NetSuite before that batch receives.
 
 ---
 
@@ -146,6 +167,66 @@ docker compose exec threepl-db pg_dump -U threepl threepl > ~/threepl-pre-prod-$
 Truncating `billing_run` also clears any sandbox test runs, which matters: a period already
 queued/pushed/invoiced is **locked against re-billing**, so a leftover sandbox run for the current
 week would block the real one.
+
+### 2a. Residual sandbox invoice — targeted purge (2026-08-01, ⏳ NOT YET RUN)
+
+A cached invoice left over from sandbox development is still showing in the production portal, so
+either §2 missed `invoice` or a sandbox-configured run re-contaminated it afterwards. `invoice` is
+**upsert-only and never prunes** (§2 table), so it will not clear itself on any future sync.
+
+Nothing in the app deletes cached rows — there is no purge endpoint and no invoice files are ever
+generated, so this is a DB-only operation on the droplet. Do it **targeted**, not by truncation,
+now that real production invoices may exist alongside it.
+
+```bash
+cd /opt/threepl/3PL-Portal
+
+# 1. Backup FIRST — non-negotiable.
+docker compose exec threepl-db pg_dump -U threepl threepl > ~/threepl-pre-invoice-purge-$(date +%F).sql
+
+# 2. Look before deleting. A sandbox leftover is one whose tranid does not exist in prod NetSuite.
+docker compose exec threepl-db psql -U threepl -d threepl -c "
+  SELECT i.id, c.slug, i.ns_invoice_id, i.tranid, i.trandate, i.status, i.total, i.synced_at,
+         (SELECT count(*) FROM invoice_line l WHERE l.invoice_id = i.id) AS lines
+  FROM invoice i JOIN customer c ON c.id = i.customer_id ORDER BY i.trandate;"
+
+docker compose exec threepl-db psql -U threepl -d threepl -c "
+  SELECT r.id, c.slug, r.period_start, r.period_end, r.status, r.ns_invoice_id,
+         r.locked_at, r.locked_by, r.created_at
+  FROM billing_run r JOIN customer c ON c.id = r.customer_id ORDER BY r.period_start;"
+
+# 3. Delete the identified invoice by its ns_invoice_id. invoice_line is ON DELETE CASCADE.
+docker compose exec threepl-db psql -U threepl -d threepl -c "
+  DELETE FROM invoice WHERE ns_invoice_id = '<the id from step 2>';"
+
+# 4. Only if a leftover billing_run blocks a week you still need to bill (a run at
+#    ready_to_push/pushed/invoiced, or one with locked_at set, refuses to be recomputed):
+docker compose exec threepl-db psql -U threepl -d threepl -c "
+  DELETE FROM billing_run WHERE id = <run id>;"     -- billing_line cascades
+```
+
+While connected, capture the two facts the billing preview depends on:
+
+```bash
+# Which days actually have an SOH snapshot? Storage is avg daily pallets over the days PRESENT,
+# so a week with no snapshot bills no storage (the preview now warns, but confirm the dates).
+docker compose exec threepl-db psql -U threepl -d threepl -c "
+  SELECT c.slug, s.snapshot_date, count(*) AS skus, sum(s.pallets) AS pallets
+  FROM stock_on_hand s JOIN customer c ON c.id = s.customer_id
+  GROUP BY c.slug, s.snapshot_date ORDER BY s.snapshot_date;"
+
+# Did the container fix land? 20-26 Jul must show 9 containers; 27 Jul-2 Aug must show 13, not 22.
+docker compose exec threepl-db psql -U threepl -d threepl -c "
+  SELECT r.ns_inbound_shipment, min(r.trandate) AS first_receipt
+  FROM item_receipt r JOIN customer c ON c.id = r.customer_id
+  WHERE c.slug = 'mova' GROUP BY r.ns_inbound_shipment ORDER BY 2, 1;"
+```
+
+### 2b. Schema addition for the period lock
+
+`billing_run.locked_at` / `locked_by` are added by `ensure_columns()` (`app/db.py`) on app
+startup — no manual DDL. Redeploy the app and they appear; `db/01_schema.sql` carries them for
+fresh environments.
 
 ---
 
@@ -362,26 +443,37 @@ Verified against live data 2026-07-26. Use these to confirm the sync worked befo
   | 010201AA000984 | MOVA S70 Roller | 2,145 | 179 |
   | 010201AA001082 | MOVA E50 Pro Ultra | 1,888 | 158 |
   | 010201AA001159 | MOVA E50 Ultra | 1,734 | 145 |
-- **Item receipts** — 9 receipts, all 24/07/2026, 6,369 units total
+- **Item receipts** — 9 receipts (`IR023981`–`IR023989`), trandate **20/07/2026**, 6,369 units total
 - **Stock on order** — 4 open lines across `POAU002108/2109/2110`, **2,145 units**, all with
   expected receipt **28/08/2026**
-- **Inbound shipments** — 12 (`INBSHIP91`–`102`): 91–99 `received` (24/07), 100–102 `in transit`
+- **Inbound shipments** — 12 (`INBSHIP91`–`102`): 91–99 `received`, 100–102 `in transit`
 - **Fulfilments** — none yet (no dispatches, so no picking charges)
 
-**Billing preview for the week 20–26 Jul 2026** — expect ≈ **$22,267.50**:
+**Billing preview for the week 20–26 Jul 2026** — expect **$19,869.00**:
 
 | Charge | Basis | Amount |
 |---|---|---|
-| Container unload | 9 shipments received × $1,500 | $13,500.00 |
+| Container unload | 9 containers (first receipt 20/07) × $1,500 | $13,500.00 |
 | Putaway | 6,369 units × $1.00 | $6,369.00 |
-| Storage | 533 pallets × $4.50 | $2,398.50 |
+| Storage | **no SOH snapshot in this week** — see below | $0.00 |
 | Picking (SO + VRMA) | 0 | $0.00 |
-| **Total** | | **$22,267.50** |
+| **Total** | | **$19,869.00** |
 
-⚠️ **The storage figure for this first week is high.** Storage is *average daily pallets × weeks*,
-and there will only be **one** SOH snapshot in the week — so it bills the full week at 533 pallets
-even though the stock only landed on the 24th. It self-corrects from next week once daily snapshots
-accumulate. If you want this first week pro-rated, bill it manually or run the period from 24 Jul.
+⚠️ **Storage is $0 for this first week, not $2,398.50 as originally predicted.** Storage is
+*average daily pallets × weeks* over the snapshot days **present in the period**, and the first
+production snapshot is dated **27 Jul** — after this week closed. There is nothing in 20–26 Jul to
+average, so the charge doesn't arise. The preview now warns rather than leaving it invisible.
+The stock was physically there from the 20th, so this **under-bills by about a week (~$2,400)**.
+Two defensible options, and it's a commercial call:
+- **Accept $0** and start storage from 27 Jul. Cleanest.
+- **Backfill one snapshot dated 2026-07-20** from the receipted quantities (6,369 units ÷ 12 =
+  531 pallets), which makes the week bill as "that reading held all week" — exactly the documented
+  single-snapshot degradation. 531 × $4.50 = **$2,389.50**, taking the week to **$22,258.50**.
+
+**Week 27 Jul – 2 Aug 2026** — the second batch: **13** containers (receipts dated 31/07) ×
+$1,500 = $19,500, putaway 7,109 × $1.00 = $7,109, plus storage over whatever snapshot days exist.
+If you see **22** containers in this week, the container fix has not been deployed — that's the
+old `lastmodifieddate` behaviour stacking both batches into one week.
 
 ---
 

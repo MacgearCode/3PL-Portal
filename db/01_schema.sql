@@ -175,9 +175,14 @@ CREATE TABLE billing_run (
     customer_id         INTEGER NOT NULL REFERENCES customer(id),
     period_start        DATE NOT NULL,
     period_end          DATE NOT NULL,
-    status              TEXT NOT NULL DEFAULT 'draft',  -- draft | approved | pushed | invoiced
+    status              TEXT NOT NULL DEFAULT 'draft',  -- draft | ready_to_push | pushed | invoiced
     ns_invoice_id       TEXT,                           -- set once a draft invoice is created in NetSuite
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Explicit period close, independent of status. A locked run can still be queued and pushed,
+    -- but its lines are frozen: neither a re-save nor the scheduled auto-generate will recompute
+    -- them. NULL = open draft. period_start/period_end are always a whole Mon-Sun week.
+    locked_at           TIMESTAMPTZ,
+    locked_by           TEXT,                           -- user email that closed the period
     UNIQUE (customer_id, period_start, period_end)
 );
 CREATE TABLE billing_line (

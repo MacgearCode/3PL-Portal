@@ -108,6 +108,43 @@ DEFAULT_CHARGES = [
     ("picking_vrma", "Picking — VRMA buy-in (per unit)", "per_unit"),
 ]
 
+
+def _billing_period(params, default: tuple[date, date]) -> tuple[date, date, str | None]:
+    """Resolve the billing period from the query string as a whole Monday–Sunday week.
+
+    Billing is locked to whole weeks. Storage is priced in pallet-weeks and the re-billing
+    guard keys on the exact (period_start, period_end) pair, so an arbitrary range both
+    mis-prices storage and lets two overlapping runs bill the same receipts (20–26 Jul and
+    24–26 Jul could both exist, each charging the same putaway).
+
+    Two accepted forms:
+      ?week=YYYY-MM-DD   any date in the wanted week — snapped to its Mon–Sun bounds. This is
+                         what the UI submits, so the UI cannot produce an invalid period.
+      ?from=&to=         the pre-existing contract (redirects, saved runs, bookmarks). Must be
+                         exactly a Monday and that Monday + 6, otherwise it is REJECTED back to
+                         the default week with a message — never silently snapped, or a stale
+                         bookmark would quietly bill a period other than the one it names.
+    """
+    wk = params.get("week")
+    if wk:
+        try:
+            return (*service.week_bounds(date.fromisoformat(wk)), None)
+        except ValueError:
+            return (*default, f"Ignored an unreadable week ({wk}).")
+    frm, to = params.get("from"), params.get("to")
+    if not (frm or to):
+        return (*default, None)
+    try:
+        ps, pe = date.fromisoformat(frm), date.fromisoformat(to)
+    except (TypeError, ValueError):
+        return (*default, "Ignored an unreadable billing period.")
+    if ps.weekday() != 0 or pe != ps + timedelta(days=6):
+        mon, sun = service.week_bounds(ps)
+        return (mon, sun, f"{ps} – {pe} is not a whole Monday–Sunday week. "
+                          f"Showing {mon} – {sun} instead.")
+    return ps, pe, None
+
+
 # --- auth --------------------------------------------------------------------
 APP_SECRET = os.environ.get("APP_SECRET", "") or "dev-insecure-secret-change-me"
 SYNC_TOKEN = os.environ.get("SYNC_TOKEN", "")
@@ -118,7 +155,8 @@ RESET_TOKEN_TTL_MIN = int(os.environ.get("RESET_TOKEN_TTL_MIN", "45"))
 # token-authed server-to-server endpoints (n8n) + public reset flow bypass the login cookie
 _EXEMPT_EXACT = {"/login", "/logout", "/forgot", "/reset",
                  "/admin/ingest", "/admin/sync-config",
-                 "/admin/billing/pending", "/admin/billing/pushed"}
+                 "/admin/billing/pending", "/admin/billing/pushed",
+                 "/admin/billing/generate"}
 
 
 def cur(request: Request) -> User | None:
@@ -461,11 +499,15 @@ def portal(slug: str, view: str, request: Request, db: Session = Depends(get_db)
     elif view == "rate_card":
         ctx["rows"] = service.rate_card_lines(db, cust.id)
     elif view == "billing":
-        ps = request.query_params.get("from") or wk_start.isoformat()
-        pe = request.query_params.get("to") or wk_end.isoformat()
-        ps_d, pe_d = date.fromisoformat(ps), date.fromisoformat(pe)
+        ps_d, pe_d, period_err = _billing_period(request.query_params, (wk_start, wk_end))
+        ps, pe = ps_d.isoformat(), pe_d.isoformat()
         res = compute_billing(db, cust, ps_d, pe_d)
+        if period_err:
+            res.warnings.insert(0, period_err)
         ctx.update(period_start=ps, period_end=pe, result=res,
+                   period_label=f"{ps_d.strftime('%a %d %b')} – {pe_d.strftime('%a %d %b %Y')}",
+                   prev_week=(ps_d - timedelta(days=7)).isoformat(),
+                   next_week=(ps_d + timedelta(days=7)).isoformat(),
                    msg=request.query_params.get("msg", ""))
         runs = db.scalars(
             select(BillingRun).where(BillingRun.customer_id == cust.id)
@@ -476,10 +518,10 @@ def portal(slug: str, view: str, request: Request, db: Session = Depends(get_db)
             select(Invoice).where(Invoice.customer_id == cust.id)).all()}
         ctx["run_invoice"] = {r.id: inv_by_ns.get(r.ns_invoice_id)
                               for r in runs if r.ns_invoice_id}
-        # a run already pushed/invoiced for this exact period blocks re-billing
+        # a run already queued/pushed, or an explicitly closed period, blocks re-billing
         same = next((r for r in runs if r.period_start == ps_d and r.period_end == pe_d), None)
-        ctx["locked_run"] = same if (same and same.status in (
-            "ready_to_push", "pushed", "invoiced")) else None
+        ctx["block_reason"] = _recompute_blocked(same)
+        ctx["locked_run"] = same if ctx["block_reason"] else None
     return templates.TemplateResponse(request, "portal.html", ctx)
 
 
@@ -504,27 +546,37 @@ def invoice_detail(slug: str, invoice_id: int, request: Request, db: Session = D
     return templates.TemplateResponse(request, "portal.html", ctx)
 
 
-@app.post("/c/{slug}/billing/run")
-async def create_billing_run(slug: str, request: Request, db: Session = Depends(get_db)):
-    user = cur(request)
-    cust = _get_customer(db, slug)
-    if not cust or not perms.is_internal(user):
-        return RedirectResponse("/", status_code=303)
-    form = await request.form()
-    ps = date.fromisoformat(form["period_start"])
-    pe = date.fromisoformat(form["period_end"])
-    res = compute_billing(db, cust, ps, pe)
-    existing = db.scalar(select(BillingRun).where(
-        BillingRun.customer_id == cust.id, BillingRun.period_start == ps,
+def _existing_run(db: Session, customer_id: int, ps: date, pe: date) -> BillingRun | None:
+    return db.scalar(select(BillingRun).where(
+        BillingRun.customer_id == customer_id, BillingRun.period_start == ps,
         BillingRun.period_end == pe))
-    if existing and existing.status in ("ready_to_push", "pushed", "invoiced"):
-        # re-billing guard: this period is already queued/pushed to NetSuite
-        return RedirectResponse(
-            f"/c/{slug}/billing?from={ps}&to={pe}&msg=already-invoiced", status_code=303)
-    if existing:
-        for l in list(existing.lines):
+
+
+def _recompute_blocked(run: BillingRun | None) -> str | None:
+    """Why this period's lines may not be (re)computed — a `msg=` code, or None if it's free.
+
+    Two independent guards: the run has left the portal for NetSuite, or the period has been
+    explicitly closed. Both must hold for the manual save AND the scheduled auto-generate, so
+    the reason lives here rather than in either caller.
+    """
+    if run is None:
+        return None
+    if run.status in ("ready_to_push", "pushed", "invoiced"):
+        return "already-invoiced"
+    if run.locked_at:
+        return "already-locked"
+    return None
+
+
+def _persist_billing_run(db: Session, cust: Customer, ps: date, pe: date, res) -> BillingRun:
+    """Write a computed result to a draft run, replacing any existing lines for the period.
+
+    Callers MUST have checked `_recompute_blocked()` first — this only writes.
+    """
+    run = _existing_run(db, cust.id, ps, pe)
+    if run:
+        for l in list(run.lines):
             db.delete(l)
-        run = existing
     else:
         run = BillingRun(customer_id=cust.id, period_start=ps, period_end=pe)
         db.add(run)
@@ -532,8 +584,55 @@ async def create_billing_run(slug: str, request: Request, db: Session = Depends(
     for kw in result_to_run_kwargs(res):
         db.add(BillingLine(billing_run_id=run.id, **kw))
     run.status = "draft"
+    return run
+
+
+@app.post("/c/{slug}/billing/run")
+async def create_billing_run(slug: str, request: Request, db: Session = Depends(get_db)):
+    user = cur(request)
+    cust = _get_customer(db, slug)
+    if not cust or not perms.is_internal(user):
+        return RedirectResponse("/", status_code=303)
+    form = await request.form()
+    try:
+        ps = date.fromisoformat(form["period_start"])
+        pe = date.fromisoformat(form["period_end"])
+    except (KeyError, TypeError, ValueError):
+        return RedirectResponse(f"/c/{slug}/billing?msg=bad-period", status_code=303)
+    # Billing periods are whole Mon–Sun weeks. The form is server-rendered from an already
+    # aligned period, so this only fires on a hand-crafted POST — refuse rather than bill a
+    # range whose storage would be mis-prorated and whose run could overlap another.
+    if ps.weekday() != 0 or pe != ps + timedelta(days=6):
+        return RedirectResponse(f"/c/{slug}/billing?msg=bad-period", status_code=303)
+    blocked = _recompute_blocked(_existing_run(db, cust.id, ps, pe))
+    if blocked:
+        return RedirectResponse(
+            f"/c/{slug}/billing?from={ps}&to={pe}&msg={blocked}", status_code=303)
+    _persist_billing_run(db, cust, ps, pe, compute_billing(db, cust, ps, pe))
     db.commit()
     return RedirectResponse(f"/c/{slug}/billing?from={ps}&to={pe}&msg=saved", status_code=303)
+
+
+@app.post("/c/{slug}/billing/lock/{run_id}")
+def lock_billing_run(slug: str, run_id: int, request: Request, db: Session = Depends(get_db)):
+    """Close a period: freeze a draft run's computed lines.
+
+    Deliberately separate from queueing. A locked run can still be pushed to NetSuite — the
+    point is that what you reviewed is what gets pushed, and neither a re-save nor the Monday
+    auto-generate can quietly recompute it underneath you.
+    """
+    user = cur(request)
+    run = db.get(BillingRun, run_id)
+    cust = _get_customer(db, slug)
+    if not cust or not run or run.customer_id != cust.id or not perms.is_internal(user):
+        return RedirectResponse("/", status_code=303)
+    qs = f"from={run.period_start}&to={run.period_end}"
+    if run.locked_at:
+        return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=already-locked", status_code=303)
+    run.locked_at = datetime.utcnow()
+    run.locked_by = user.email if user else None
+    db.commit()
+    return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=locked", status_code=303)
 
 
 @app.post("/c/{slug}/billing/push/{run_id}")
@@ -878,6 +977,59 @@ def admin_billing_pending(request: Request, db: Session = Depends(get_db)):
                        "qty": float(l.qty or 0), "rate": float(l.rate or 0),
                        "amount": float(l.amount or 0)} for l in r.lines]})
     return JSONResponse({"pending": out})
+
+
+@app.post("/admin/billing/generate")
+async def admin_billing_generate(request: Request, db: Session = Depends(get_db)):
+    """Auto-generate the draft billing run for a completed week, for every active customer.
+
+    Called by the n8n FULL lane at the END of its run (after all six reads land) so the week's
+    receipts and fulfilments are in the cache before anything is computed. Never on the 15-min
+    SOH lane.
+
+    Generates only, never pushes: the run lands at `draft` for a human to review and queue.
+    Idempotent — a period that already has a run is skipped rather than recomputed, so a
+    reviewed or closed draft is safe from a re-run. Optional body: {"week": "YYYY-MM-DD"} to
+    target the week containing that date (backfill); default is the most recently *completed*
+    week, i.e. the one before the current one.
+    """
+    if not _token_ok(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    anchor = payload.get("week") if isinstance(payload, dict) else None
+    try:
+        target = date.fromisoformat(anchor) if anchor else date.today() - timedelta(days=7)
+    except (TypeError, ValueError):
+        return JSONResponse({"error": f"unreadable week: {anchor}"}, status_code=400)
+    ps, pe = service.week_bounds(target)
+
+    out = []
+    for cust in db.scalars(select(Customer).where(Customer.active == True)).all():  # noqa: E712
+        row = {"customer": cust.slug, "period_start": ps.isoformat(),
+               "period_end": pe.isoformat()}
+        existing = _existing_run(db, cust.id, ps, pe)
+        if existing:
+            row.update(generated=False, skipped=_recompute_blocked(existing) or "run-exists",
+                       run_id=existing.id, status=existing.status)
+        else:
+            res = compute_billing(db, cust, ps, pe)
+            if not res.lines:
+                # No billable activity — don't plant an empty run that a human has to dismiss.
+                row.update(generated=False, skipped="no-billable-activity")
+            else:
+                run = _persist_billing_run(db, cust, ps, pe, res)
+                row.update(generated=True, run_id=run.id, total=res.total,
+                           lines=len(res.lines))
+            # Warnings are the whole point of surfacing under-bills — put them in the n8n log
+            # too, not just the portal, so a zero charge is visible without opening the app.
+            if res.warnings:
+                row["warnings"] = res.warnings
+        out.append(row)
+    db.commit()
+    return JSONResponse({"week": [ps.isoformat(), pe.isoformat()], "customers": out})
 
 
 @app.post("/admin/billing/pushed")

@@ -63,9 +63,12 @@ def _seed_mova_demo(db, mova):
     ]
     db.add_all(items)
 
-    # Inbound shipments (containers) — three landed over the last three weeks, two still
-    # in transit. The in-transit pair carries the outstanding PO stock + its expected
-    # receipt date, and is what the "Incoming" chart series buckets by week.
+    # Inbound shipments (containers) — four landed (the last one this week, so the billing view's
+    # default period has a container charge in it), two still in transit. The in-transit pair
+    # carries the outstanding PO stock + its expected receipt date, and is what the "Incoming"
+    # chart series buckets by week.
+    # received_date here is only a landed/not-landed flag + a display date; the container charge
+    # is dated off the linked item receipt's trandate instead (see billing.py).
     db.add_all([
         InboundShipment(customer_id=mova.id, ns_shipment_id="IS5001", container_no="CSNU8516117",
                         shipment_number="ISMOV0001", container_type="40ft loose stacked",
@@ -82,6 +85,10 @@ def _seed_mova_demo(db, mova):
         InboundShipment(customer_id=mova.id, ns_shipment_id="IS5005", container_no="COTU4966532",
                         shipment_number="ISMOV0005", container_type="40ft loose stacked",
                         expected_date=d(23), received_date=None, status="in transit"),
+        InboundShipment(customer_id=mova.id, ns_shipment_id="IS5006", container_no="OOCU8959245",
+                        shipment_number="ISMOV0006", container_type="40ft loose stacked",
+                        expected_date=min(d(1), today), received_date=min(d(1), today),
+                        status="received"),
     ])
 
     # Open POs (stock on order) — partially received. The first PO's outstanding lines sit
@@ -103,15 +110,18 @@ def _seed_mova_demo(db, mova):
                qty_received=0),
     ])
 
-    # Item receipts (putaway) — the three landed containers plus one this week. Quantities
+    # Item receipts (putaway) — the four landed containers, the last one this week so the
+    # billing view (which opens on the current week) has a container charge to show. Quantities
     # tie back to the PO lines above (90001: 6000+3000=9000, 90002: 4000+1500=5500).
-    # ns_inbound_shipment carries the container through to the receipts view; the last one is
-    # deliberately unlinked so the "no container" case (—) is visible in the demo too.
+    # EVERY receipt carries ns_inbound_shipment: it's no longer just the container column on the
+    # receipts view, it's what the container-unload charge is counted and dated off (billing.py).
+    # An unlinked receipt is now a real under-bill and raises a warning on the billing preview —
+    # so the demo must not ship one, or the demo permanently looks broken.
     for ns_id, tranid, day, ship, qty1, qty2 in [
         ("IR8001", "IRAU020001", d(-21), "ISMOV0001", 6000, 0),
         ("IR8002", "IRAU020002", d(-13), "ISMOV0002", 0, 4000),
         ("IR8003", "IRAU020003", d(-5), "ISMOV0003", 3000, 0),
-        ("IR8004", "IRAU020004", min(d(1), today), None, 0, 1500),
+        ("IR8004", "IRAU020004", min(d(1), today), "ISMOV0006", 0, 1500),
     ]:
         r = ItemReceipt(customer_id=mova.id, ns_receipt_id=ns_id, tranid=tranid, trandate=day,
                         ns_inbound_shipment=ship, po_tranid="POAU010001" if ship else None)

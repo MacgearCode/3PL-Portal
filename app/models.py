@@ -220,9 +220,14 @@ class BillingRun(Base):
     customer_id: Mapped[int] = mapped_column(ForeignKey("customer.id"))
     period_start: Mapped[date] = mapped_column(Date)
     period_end: Mapped[date] = mapped_column(Date)
-    status: Mapped[str] = mapped_column(String, default="draft")    # draft|approved|pushed|invoiced
+    status: Mapped[str] = mapped_column(String, default="draft")  # draft|ready_to_push|pushed|invoiced
     ns_invoice_id: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Explicit period close, independent of status: a locked run may still be queued and pushed,
+    # but its computed lines are frozen and will not be recomputed by a re-save or by the
+    # scheduled auto-generate. NULL = open draft.
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String, nullable=True)  # user email
     lines: Mapped[list["BillingLine"]] = relationship(
         back_populates="run", cascade="all, delete-orphan")
 

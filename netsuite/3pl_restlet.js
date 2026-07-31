@@ -132,6 +132,14 @@ define(['N/query', 'N/record'], function (query, record) {
     // charge, to populate one cosmetic column. Now a failure blanks these two columns and nothing
     // else. Scoped by receipt id — the same id-list pattern inboundShipments uses — so it stays
     // cheap and can't pull in other subsidiaries' receipts.
+    //
+    // ⚠️ ns_inbound_shipment is NO LONGER COSMETIC (2026-08-01). billing.py now derives the
+    // container-unload charge from it — receipt -> shipment, dated by the receipt's trandate —
+    // because the shipment header's own dates are unusable (see inboundShipments below). So a
+    // blank here is a $1,500-per-container under-bill, not a missing decoration. The try/catch
+    // stays (losing the receipts would also lose putaway, which is worse), but the app now
+    // WARNS on the billing preview for any receipt in the period with no shipment linked —
+    // don't "simplify" that warning away.
     var extra = {}, warn = null, rcptIds = {};
     flat.forEach(function (r) { rcptIds[String(r.id)] = true; });
     var idList = Object.keys(rcptIds);
@@ -288,14 +296,16 @@ define(['N/query', 'N/record'], function (query, record) {
       "SELECT id, shipmentnumber, externaldocumentnumber, expecteddeliverydate, " +
       "actualdeliverydate, lastmodifieddate, shipmentstatus " +
       "FROM inboundshipment WHERE id IN (" + idList.join(',') + ")");
-    // received_date drives the weekly container-unload charge (billing.py counts shipments
-    // received in the period). VALIDATED 2026-06-30: actualdeliverydate is populated on only
-    // ~3% of received shipments, so it's useless as the trigger. Instead a shipment counts as
-    // received when its STATUS says so (received | partiallyReceived), dated by actualdeliverydate
-    // or, failing that, lastmodifieddate (both 100% reliable) as the proxy for when it was marked
-    // received. in-transit shipments get no received_date, so they aren't charged until they land.
-    // Caveat: editing a received shipment later moves lastmodifieddate; a partiallyReceived ->
-    // received transition in a later week re-dates it to that week (re-run the affected periods).
+    // received_date is a RECEIVED/NOT-RECEIVED FLAG and a display date. It no longer drives
+    // billing — do not restore that. VALIDATED against production 2026-07-31: actualdeliverydate
+    // is NULL on all 36 Mova 3PL shipments, so the lastmodifieddate fallback below always applies,
+    // and lastmodifieddate is the timestamp of whoever last touched the record, not a delivery.
+    // All 36 clustered onto four bulk-edit timestamps (9 containers physically unloaded 20 Jul
+    // read as 30 Jul), which billed 0 containers in the 20-26 Jul week and 22 in the next one.
+    // billing.py now dates the container-unload charge off the ITEM RECEIPT's trandate instead.
+    // Still useful here: the PRESENCE of received_date is a reliable "status is received /
+    // partiallyReceived" test (in-transit shipments get none), which billing.py uses to flag
+    // containers that landed but have no receipt pointing at them.
     var STATUS = { received: 'received', partiallyReceived: 'partially received',
                    inTransit: 'in transit' };
     return heads.map(function (h) {

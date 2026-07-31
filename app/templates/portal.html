@@ -321,14 +321,30 @@
       <div class="flowline">Automated weekly run · <code>SuiteQL</code> → <code>rate card</code> → <code>draft invoice</code> on the {{ customer.name }} customer record · replaces 5 manual saved searches</div>
       {% set flash = {'saved':['ok','Billing run saved as draft.'],
                       'queued':['ok','Queued for NetSuite — n8n creates the draft invoice on its next run; it appears under Invoices after the following sync.'],
+                      'locked':['ok','Period closed. The lines are frozen — it can still be pushed, but not recomputed.'],
                       'already-queued':['warn','This run is already queued or pushed.'],
+                      'already-locked':['warn','This period is closed — its lines are frozen and cannot be recomputed.'],
+                      'bad-period':['warn','Billing periods must be a whole Monday–Sunday week.'],
                       'already-invoiced':['warn','This period is already queued/invoiced — re-billing is blocked.']}.get(msg) %}
       {% if flash %}<div class="flash {{ flash[0] }}">{{ flash[1] }}</div>{% endif %}
-      {% if locked_run %}<div class="flash warn">This period was already pushed to NetSuite (run #{{ locked_run.id }}) — preview is read-only to prevent double-billing.</div>{% endif %}
+      {% if locked_run %}<div class="flash warn">{% if block_reason == 'already-locked' %}This
+        period was closed{% if locked_run.locked_by %} by {{ locked_run.locked_by }}{% endif %} (run
+        #{{ locked_run.id }}) — the lines below are frozen.{% else %}This period was already pushed to
+        NetSuite (run #{{ locked_run.id }}) — preview is read-only to prevent double-billing.{% endif %}</div>{% endif %}
+      {# Under-billing risks from the charge engine — a charge computing to zero must never be
+         invisible. This is how 9 containers went missing for a fortnight. #}
+      {% if result.warnings %}<div class="flash warn"><b>Check these before pushing</b>
+        <ul class="warnlist">{% for w in result.warnings %}<li>{{ w }}</li>{% endfor %}</ul></div>{% endif %}
+      {# Billing weeks only. A single date picks the week that contains it, so the form cannot
+         submit a period that isn't a whole Mon–Sun week (storage is priced in pallet-weeks). #}
       <form class="period" method="get" action="/c/{{ customer.slug }}/billing">
-        <label>From <input type="date" name="from" value="{{ period_start }}"></label>
-        <label>To <input type="date" name="to" value="{{ period_end }}"></label>
+        <a class="btn mini" href="/c/{{ customer.slug }}/billing?week={{ prev_week }}"
+           title="Previous week">←</a>
+        <label>Billing week <input type="date" name="week" value="{{ period_start }}"></label>
         <button type="submit">Preview</button>
+        <a class="btn mini" href="/c/{{ customer.slug }}/billing?week={{ next_week }}"
+           title="Next week">→</a>
+        <span class="sub2">{{ period_label }}</span>
       </form>
       <div class="billgrid">
         <div class="card"><div class="tablewrap"><table>
@@ -360,7 +376,9 @@
         <tbody>{% for run in runs %}
         {% set chipcls = 'c-good' if run.status=='invoiced' else 'c-info' if run.status=='pushed' else 'c-warn' if run.status=='ready_to_push' else 'c-neutral' %}
         <tr><td>{{ run.period_start|dshort }} – {{ run.period_end|dshort }}</td>
-          <td><span class="chip {{ chipcls }}">{{ run.status|replace('_',' ') }}</span></td>
+          <td><span class="chip {{ chipcls }}">{{ run.status|replace('_',' ') }}</span>
+            {% if run.locked_at %}<span class="chip c-neutral"
+              title="Closed{% if run.locked_by %} by {{ run.locked_by }}{% endif %} — lines frozen">closed</span>{% endif %}</td>
           <td class="r num">{{ run.lines|length }}</td>
           <td class="r num">${{ (run.lines|sum(attribute='amount'))|money }}</td>
           <td>{% if run_invoice.get(run.id) %}<a class="link" href="/c/{{ customer.slug }}/invoice/{{ run_invoice[run.id] }}">View invoice</a>
@@ -368,8 +386,15 @@
               {% elif run.status == 'ready_to_push' %}<span class="sub2">queued for n8n</span>
               {% else %}<span class="sub2">—</span>{% endif %}</td>
           <td class="r">{% if run.status == 'draft' %}
-            <form method="post" action="/c/{{ customer.slug }}/billing/push/{{ run.id }}">
-              <button class="btn mini" type="submit">Queue for NetSuite</button></form>
+            <div class="runacts">
+              {% if not run.locked_at %}
+              <form method="post" action="/c/{{ customer.slug }}/billing/lock/{{ run.id }}">
+                <button class="btn mini" type="submit"
+                  title="Freeze these lines so nothing recomputes them">Close period</button></form>
+              {% endif %}
+              <form method="post" action="/c/{{ customer.slug }}/billing/push/{{ run.id }}">
+                <button class="btn mini" type="submit">Queue for NetSuite</button></form>
+            </div>
           {% endif %}</td>
         </tr>{% endfor %}</tbody>
       </table></div></div>

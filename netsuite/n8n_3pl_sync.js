@@ -156,6 +156,31 @@ for (const c of CUSTOMERS) {
   }
 }
 
+// 1b) AUTO-GENERATE the draft billing run for the most recently completed Mon–Sun week.
+//     Runs AFTER all six reads so the week's receipts/fulfilments are in the cache before
+//     anything is computed — computing first would under-bill whatever hadn't landed yet.
+//     Full lane only. Generates a `draft` for review; it does NOT queue or push, so a newly
+//     generated run is deliberately not picked up by the push loop below in the same pass.
+//     Idempotent, and the app resolves the target week from its own clock (today − 7d, which
+//     lands in the previous week on any day), so a daily full lane just re-attempts and skips —
+//     meaning a failed Monday run self-heals on Tuesday rather than losing the week.
+//     The response carries any under-bill warnings (unlinked containers, missing SOH snapshot)
+//     so a zero charge is visible in the n8n log without opening the portal.
+if (DO_WRITES) try {
+  const gen = await helpers.httpRequest({
+    method: 'POST', url: `${APP_BASE}/admin/billing/generate`, headers: appHeaders,
+    body: {}, json: true });
+  out.push({ json: Object.assign({ step: 'generate' }, gen) });
+  for (const c of (gen.customers || [])) {
+    if (c.warnings && c.warnings.length) {
+      out.push({ json: { step: 'generate', level: 'warn', customer: c.customer,
+        period: [c.period_start, c.period_end], warnings: c.warnings } });
+    }
+  }
+} catch (e) {
+  out.push({ json: { step: 'generate', level: 'error', error: String(e.message || e) } });
+}
+
 // 2) WRITES: create a draft invoice for each queued billing run, then report it back.
 //    Full lane only — the 15-min SOH lane must not poll/push billing.
 if (DO_WRITES) try {

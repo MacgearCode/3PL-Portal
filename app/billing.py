@@ -3,7 +3,7 @@
 Replaces the manual weekly saved searches (brief, priority 2). Given a customer and a
 period, computes one billing line per charge type off the active rate card:
 
-  container_unload  count of inbound shipments received in period       x per_container
+  container_unload  count of containers first receipted in period       x per_container
   putaway           sum of item-receipt-line units in period            x per_unit
   storage           avg daily pallets x weeks in period                 x per_pallet_week
   picking_so        sum of SO-fulfilment units in period                x per_unit
@@ -14,6 +14,10 @@ daily totals are averaged and scaled by the weeks the period spans (SOH is now a
 snapshot refreshed every ~15 min, so summing every snapshot would overcharge ~7x).
 Fulfilment units are positive-only — the cache already stores positives, but we guard here too.
 
+Anything that would silently UNDER-bill is collected into `BillingResult.warnings` and shown
+on the preview. A charge quietly computing to zero is how 9 containers went missing for a
+fortnight; a missing charge must be visible, not absent.
+
 This module is pure: it reads the cache and returns a result. Persisting a BillingRun
 and pushing a draft invoice to NetSuite are separate steps (service / netsuite layers).
 """
@@ -22,7 +26,7 @@ import math
 from dataclasses import dataclass, field
 from datetime import date
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from .models import (Customer, InboundShipment, ItemFulfilment, ItemFulfilmentLine,
@@ -46,6 +50,7 @@ class BillingResult:
     period_start: date
     period_end: date
     lines: list  # list[ComputedLine]
+    warnings: list = field(default_factory=list)  # under-billing risks, surfaced on the preview
 
     @property
     def total(self) -> float:
@@ -67,13 +72,23 @@ def _rates(card: RateCard) -> dict[str, RateCardLine]:
     return {l.charge_type: l for l in card.lines}
 
 
-def compute_billing(db: Session, customer: Customer,
-                    period_start: date, period_end: date) -> BillingResult:
+def _names(items: list, limit: int = 10) -> str:
+    """Comma-list for a warning message, truncated so a systemic fault can't flood the page."""
+    head = ", ".join(str(i) for i in items[:limit])
+    return head if len(items) <= limit else f"{head} (+{len(items) - limit} more)"
+
+
+def compute_billing(db: Session, customer: Customer, period_start: date, period_end: date,
+                    warn: bool = True) -> BillingResult:
+    """Compute the period's charges. `warn=False` skips the under-billing checks and their
+    queries — for the overview chart, which calls this 5x a page load and only reads totals.
+    Never pass warn=False anywhere a human is deciding whether to invoice."""
     card = active_rate_card(db, customer.id, period_end)
     if card is None:
         return BillingResult(customer.id, period_start, period_end, [])
     rates = _rates(card)
     lines: list[ComputedLine] = []
+    warnings: list[str] = []
 
     def add(charge_type: str, qty: float, refs: list):
         rc = rates.get(charge_type)
@@ -83,19 +98,29 @@ def compute_billing(db: Session, customer: Customer,
         lines.append(ComputedLine(charge_type, rc.label, qty, float(rc.rate),
                                   amount, rc.basis, refs))
 
-    # --- container unload: inbound shipments received in period ---------------
-    # `received_date` is set by the RESTlet only once a shipment's status is received/
-    # partiallyReceived (sourced actualdeliverydate -> lastmodifieddate, since NetSuite barely
-    # populates actualdeliverydate). In-transit shipments have no received_date, so the filter
-    # below naturally excludes them — they aren't charged until they land. See 3pl_restlet.js.
-    shipments = db.scalars(
-        select(InboundShipment).where(
-            InboundShipment.customer_id == customer.id,
-            InboundShipment.received_date != None,                      # noqa: E711
-            InboundShipment.received_date >= period_start,
-            InboundShipment.received_date <= period_end)).all()
-    add("container_unload", len(shipments),
-        [s.shipment_number or s.ns_shipment_id for s in shipments])
+    # --- container unload: containers first receipted in period ---------------
+    # Dated by the ITEM RECEIPT's trandate, NOT the shipment header.
+    #
+    # Why: NetSuite leaves `inboundshipment.actualdeliverydate` NULL on every Mova 3PL
+    # shipment (all 36, verified in production 2026-07-31), so the RESTlet's fallback to
+    # `lastmodifieddate` was dating the charge to whenever someone last *touched* the record.
+    # For the 9 containers unloaded 2026-07-20 that was 2026-07-30 10:04-10:08 — a manual bulk
+    # pass ten days and one month-boundary later. Result: the 20-26 Jul week billed 0 containers
+    # and the following week billed 22. The receipt trandate is the physical unload and, unlike
+    # lastmodifieddate, does not move when the record is edited, so the charge is idempotent.
+    #
+    # A container is charged in the week of its EARLIEST receipt (MIN over ALL history, not just
+    # this period), so one split across two receipts in different periods is billed once, in the
+    # first — never twice.
+    first_receipt = db.execute(
+        select(ItemReceipt.ns_inbound_shipment, func.min(ItemReceipt.trandate))
+        .where(ItemReceipt.customer_id == customer.id,
+               ItemReceipt.ns_inbound_shipment != None,                 # noqa: E711
+               ItemReceipt.trandate != None)                            # noqa: E711
+        .group_by(ItemReceipt.ns_inbound_shipment)).all()
+    containers = sorted(
+        ship for ship, first in first_receipt if period_start <= first <= period_end)
+    add("container_unload", len(containers), containers)
 
     # --- putaway: item-receipt units in period --------------------------------
     # selectinload: the line walk below is otherwise one query per receipt, and the overview
@@ -108,6 +133,34 @@ def compute_billing(db: Session, customer: Customer,
         .options(selectinload(ItemReceipt.lines))).all()
     putaway_units = sum(float(l.qty) for r in receipts for l in r.lines)
     add("putaway", putaway_units, [r.tranid or r.ns_receipt_id for r in receipts])
+
+    if warn:
+        # `ns_inbound_shipment` used to be a purely cosmetic column on the receipts view, fetched
+        # by the RESTlet in a try/catch that blanks it rather than losing the receipts
+        # (3pl_restlet.js). The container charge above now depends on it, so a blank is no longer
+        # harmless: it silently drops $1,500 a container. Surface it instead of absorbing it.
+        unlinked = [r.tranid or r.ns_receipt_id for r in receipts if not r.ns_inbound_shipment]
+        if unlinked:
+            warnings.append(
+                f"{len(unlinked)} receipt(s) in this period are not linked to a container, so no "
+                f"container-unload charge was raised for them: {_names(unlinked)}. Check the "
+                f"inbound shipment on the receipt in NetSuite.")
+
+        # Containers NetSuite says have landed but which no receipt points at — they will never be
+        # charged in any period. Not scoped to this period: it's a standing under-bill either way.
+        # `received_date`'s VALUE is untrusted (see the container block), but its PRESENCE is a
+        # reliable "status is received/partiallyReceived" flag, which is all this needs.
+        receipted = {ship for ship, _ in first_receipt}
+        landed = db.scalars(
+            select(InboundShipment).where(
+                InboundShipment.customer_id == customer.id,
+                InboundShipment.received_date != None)).all()            # noqa: E711
+        stranded = sorted(s.shipment_number or s.ns_shipment_id for s in landed
+                          if (s.shipment_number or s.ns_shipment_id) not in receipted)
+        if stranded:
+            warnings.append(
+                f"{len(stranded)} container(s) are marked received in NetSuite but have no item "
+                f"receipt, so they are not billable in any period: {_names(stranded)}.")
 
     # --- storage: average daily pallets x weeks in period ---------------------
     # SOH is now snapshotted often (every ~15 min, collapsed to one row per item per
@@ -138,6 +191,13 @@ def compute_billing(db: Session, customer: Customer,
                      f"snapshot day(s) x {round(weeks, 3)} week(s)",
                      *sorted(d.isoformat() for d in daily_pallets)]
         add("storage", pallet_weeks, snap_refs)
+    elif warn:
+        # No snapshot inside the period — storage silently computes to nothing. True for any week
+        # before the sync started (production's first snapshot is 2026-07-27), so the week the
+        # stock actually landed bills no storage at all unless a snapshot is backfilled.
+        warnings.append(
+            "No stock-on-hand snapshot exists inside this period, so no storage was charged. "
+            "Storage cannot be computed for a week the sync did not cover.")
 
     # --- picking: SO and VRMA fulfilment units in period ----------------------
     for charge_type, source in (("picking_so", "SO"), ("picking_vrma", "VRMA")):
@@ -151,7 +211,7 @@ def compute_billing(db: Session, customer: Customer,
         units = sum(max(0.0, float(l.qty)) for f in fulfils for l in f.lines)
         add(charge_type, units, [f.tranid or f.ns_fulfilment_id for f in fulfils])
 
-    return BillingResult(customer.id, period_start, period_end, lines)
+    return BillingResult(customer.id, period_start, period_end, lines, warnings)
 
 
 def result_to_run_kwargs(res: BillingResult) -> list[dict]:

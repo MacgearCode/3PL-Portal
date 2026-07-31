@@ -10,28 +10,49 @@ The cutover record — verified prod ids, TBA/role setup, the cache purge, and t
 actually hit — is `docs/production_cutover.md`.
 
 **First production data (Mova, week of 20–26 Jul 2026):** 5 SKUs / 6,369 units / 533 pallets on
-hand, 9 receipts (6,369 units) off 9 containers, 12 inbound shipments (`INBSHIP91`–`102`, 9
-received / 3 in transit), 4 open PO lines (2,145 units, ETA 28/08). No dispatches yet.
+hand, 9 receipts (6,369 units) off 9 containers (`INBSHIP91`–`99`), 4 open PO lines. No dispatches yet.
+
+**As at 2026-08-01 (re-read from production):** **36 inbound shipments — 22 received / 14 in
+transit** (`INBSHIP91`–`102` + `INBSHIP106`–`129`; ids 103–105 are out of scope). A second batch
+of 13 containers landed 28–31 Jul: receipts dated **31 Jul**, 7,109 units. Total on hand
+**13,478 units / 1,112 pallets** across 12 SKUs (= 6,369 + 7,109 exactly; nothing dispatched, no
+shrinkage). Storage at 1,112 pallets is **$5,004/week**.
+⚠️ Three SKUs have `custitem_pallet_quantity` **NULL** — `52856` / `52857` / `52858`
+(`20010100002916`, `20010100003083`, `20010100003085`), 8,000 units on order between them. They
+hold no stock yet, but the moment they receive they contribute **0 pallets** to storage. Populate
+the field in NetSuite before that batch lands.
 
 **Remaining work: the billing write path** — see *Billing roadmap* below. Reads are done; the
 draft-invoice push is not yet configured (needs the 3PL billing customer record + `CHARGE_ITEMS`
 mapped to production items, `docs/production_cutover.md` §1). "Queue for NetSuite" will error
 until those land. Skriva remains live as the reference customer.
 
-## Billing roadmap (agreed 2026-07-27 — NOT yet built)
-Target shape: **lock the period → auto-generate the draft at period end → review/edit → manual
-push to NetSuite.** Nothing should ever post automatically.
+## Billing roadmap (built 2026-08-01)
+Shape: **whole Mon–Sun period → auto-generate the draft at period end → review → close → manual
+push to NetSuite.** Nothing ever posts automatically.
 
 | Piece | State |
 |---|---|
-| Manual push only ("Queue for NetSuite" → n8n → **draft** invoice, approved by a human in NS) | ✅ already how it works — no auto-post exists |
-| One run per period (`billing_run` unique on customer+period) | ✅ built |
-| Re-billing guard — a period at `ready_to_push`/`pushed`/`invoiced` can't be re-saved or re-queued | ✅ built (partial period lock) |
-| **Explicit period lock/close** — a *draft* run can still be recomputed today; there's no "close this period" action | ❌ to build |
-| **Auto-generate the draft at period end** — today a human opens Billing run, picks dates, Preview → Save | ❌ to build (n8n schedule → a new endpoint, mirroring the existing sync lanes) |
-| **Edit the draft before pushing** | ⚠️ **decide first:** lines are editable in *NetSuite* after the draft is created (works today). Editing the computed lines *in the portal* before push — adjusting a qty, adding an ad-hoc charge — is a different, larger feature. Confirm which is wanted. |
+| Manual push only ("Queue for NetSuite" → n8n → **draft** invoice, approved by a human in NS) | ✅ no auto-post exists |
+| One run per period (`billing_run` unique on customer+period) | ✅ |
+| Re-billing guard — a period at `ready_to_push`/`pushed`/`invoiced` can't be re-saved or re-queued | ✅ |
+| **Week-aligned periods** — the UI submits `?week=<any date>` and snaps to that Mon–Sun week; a hand-edited `?from=/?to=` that isn't a whole week is **rejected with a message**, never silently snapped. A non-week POST is refused (`msg=bad-period`) | ✅ built |
+| **Explicit period close** — `billing_run.locked_at` / `locked_by`, "Close period" on a draft. A closed run **can still be queued and pushed**; what it cannot do is be recomputed, by a re-save or by the scheduled generate | ✅ built |
+| **Auto-generate the draft at period end** — `POST /admin/billing/generate` (token-authed), called at the END of the n8n full lane. Targets `week_bounds(today − 7d)` = the most recently completed week; idempotent (existing run → skipped, never recomputed); plants nothing when there's no billable activity; lands at `draft` | ✅ built |
+| **Edit the draft before pushing** | Decided: **NetSuite-side only.** Lines are editable on the draft invoice in NS after it's created. The portal's numbers stay a faithful record of what the rate card produced — don't add portal-side line editing without revisiting this. |
 
-Statuses today: `draft → ready_to_push → pushed → invoiced`.
+Statuses: `draft → ready_to_push → pushed → invoiced`, with `locked_at` an orthogonal freeze flag.
+
+Why `generate` runs last in the full lane: it must see all six reads land first, or it bills a
+week whose receipts haven't arrived. It resolves the week from the app's own clock (`today − 7d`
+lands in the previous week on **any** weekday), so a daily full lane just re-attempts and skips —
+a failed Monday self-heals on Tuesday instead of losing the week.
+
+**Under-billing is surfaced, never silent** (`BillingResult.warnings`, rendered on the preview and
+echoed into the n8n log): receipts in the period with no container linked, containers marked
+received in NetSuite that no receipt points at, and **no SOH snapshot inside the period** (which
+otherwise drops the storage charge to nothing with no trace). A charge computing to zero must be
+visible — that's the whole lesson of the container bug below.
 
 ## Build (the real app, in `app/`)
 FastAPI + SQLAlchemy, `DATABASE_URL` (SQLite local / Postgres droplet). `app/main.py` (auth, customer
@@ -156,6 +177,28 @@ not the code. Per-view permission table in `docs/production_cutover.md` §7.
 charge derived from it) to an all-or-nothing lookup for a decorative column. Receipts' `po_tranid`
 was a correlated subquery in the SELECT list; both it and the fulfilment source lookup are now
 separate, id-scoped and `try/catch`'d, so a failure blanks one column instead of dropping every row.
+⚠️ **But `ns_inbound_shipment` is no longer cosmetic** (2026-08-01) — the container-unload charge
+now depends on it, so a blank is a $1,500-per-container under-bill. The `try/catch` stays (losing
+the receipts would also lose putaway), and the billing preview **warns** on any receipt in the
+period with no shipment linked. Don't remove that warning.
+
+**⚠️ `inboundshipment` header dates are unusable for billing. Date the container charge off the
+ITEM RECEIPT.** Verified against production 2026-07-31: **`actualdeliverydate` is NULL on all 36**
+Mova 3PL shipments, so the RESTlet's `COALESCE(actualdeliverydate, lastmodifieddate)` fallback
+always applies — and `lastmodifieddate` is the timestamp of whoever last *touched* the record, not
+a delivery. All 36 clustered onto four bulk-edit timestamps; the 9 containers physically unloaded
+**20 Jul** read as **30 Jul**. Consequence before the fix: the 20–26 Jul week billed **0**
+containers ($0 instead of $13,500) and the next week billed **22** ($33,000), across a month
+boundary. `expecteddeliverydate` is no better — NULL on `91`–`102` and a blanket `2026-07-28` on
+`106`–`129`.
+`billing.py` now counts containers via `item_receipt.ns_inbound_shipment`, dated by
+`MIN(item_receipt.trandate)` per shipment across **all** history — so a container split across two
+receipts in different weeks is charged once, in the earlier, and the charge is **idempotent**
+(a trandate doesn't move when someone edits the record; a lastmodifieddate does).
+`inbound_shipment.received_date` is now only a received/not-received **flag** (its presence, not
+its value) plus a display date. Don't restore it as a billing trigger.
+Prod `shipmentstatus` strings are exactly `received` (22) and `inTransit` (14) — no
+`partiallyReceived`, no padding; the code's test matches.
 
 ## The business model
 - Macgear does **not** buy or own the stock — it transacts it and charges a fee for receiving, storing, dispatching.
@@ -178,7 +221,7 @@ separate, id-scoped and `try/catch`'d, so a failure blanks one column instead of
 ## Rate card (Mova)
 | Charge | Rate | Basis |
 |---|---|---|
-| Container unload — 40ft loose stacked | $1,500 | per container (inbound shipments received) |
+| Container unload — 40ft loose stacked | $1,500 | per container (dated by its item receipt's `trandate` — **not** the shipment header, see above) |
 | Putaway | $1.00 | per unit (item receipts vs 3PL loc, brand MOVA) |
 | Storage | $4.50 | per pallet / week (units on hand ÷ units/pallet) |
 | Picking | $1.00 | per unit (item fulfilments — SO **and** VRMA) |
@@ -222,11 +265,16 @@ Stock on order (open POs) · Item receipts · Stock on hand · Item fulfilments 
   (items not in the pull are zeroed; zero-qty hidden from the view) and stamps `synced_at`. Today's SOH
   row is overwritten in place; older days persist as daily history. **Storage billing = AVG daily pallets
   × weeks** (`billing.py`) — never sum every snapshot (would overcharge ~7× at this cadence).
-- **Writes:** "Queue for NetSuite" sets `billing_run.status='ready_to_push'` (no NS call). n8n polls
+- **Writes:** the full lane also POSTs `/admin/billing/generate` **after all six reads**, which
+  drafts the previous Mon–Sun week per customer (idempotent; see *Billing roadmap*). It generates
+  only — a fresh draft is deliberately not pushed in the same pass.
+  "Queue for NetSuite" sets `billing_run.status='ready_to_push'` (no NS call). n8n polls
   `GET /admin/billing/pending`, creates the **draft** invoice via the RESTlet `create_invoice` action,
   then `POST /admin/billing/pushed` ({run_id, ns_invoice_id}) → status `pushed`. Next read-sync pulls the
   real invoice; the run links to it via `ns_invoice_id`. Statuses: draft→ready_to_push→pushed→invoiced.
-- **Re-billing guard:** a period already queued/pushed/invoiced can't be re-saved or re-queued.
+- **Re-billing guard:** a period already queued/pushed/invoiced, or explicitly closed
+  (`locked_at`), can't be re-saved or recomputed. Both reasons come from
+  `main._recompute_blocked()` — one place, shared by the manual save and the scheduled generate.
 - Customers drill the Invoices list → per-invoice charge-line detail (`/c/{slug}/invoice/{id}`, customer-scoped).
 - Artifacts: `netsuite/3pl_restlet.js`, `netsuite/n8n_3pl_sync.js`. App needs only env `SYNC_TOKEN`.
 

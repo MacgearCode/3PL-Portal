@@ -51,7 +51,9 @@ def ensure_columns():
                  # location_scoped: added when the regular-brand model landed (2026-07-22). Existing
                  # rows get NULL (read as False); the sync coerces bool(). BOOLEAN is portable to both
                  # SQLite (INTEGER affinity) and Postgres; no DEFAULT so Postgres doesn't reject `0`.
-                 "customer": {"location_scoped": "BOOLEAN"}}
+                 "customer": {"location_scoped": "BOOLEAN"},
+                 # Explicit period close (2026-08-01). NULL = still an open draft, recomputable.
+                 "billing_run": {"locked_at": "TIMESTAMP", "locked_by": "VARCHAR"}}
     insp = inspect(engine)
     with engine.begin() as conn:
         for table, cols in additions.items():
