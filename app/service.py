@@ -7,6 +7,7 @@ high-water mark, but the overview no longer anchors to it (the incoming-units se
 forward-looking and has to agree with the calendar).
 """
 import math
+import re
 from datetime import date, timedelta
 
 from sqlalchemy import func, or_, select
@@ -334,6 +335,47 @@ def recent_fulfilments(db: Session, customer_id: int, imap: dict, limit: int) ->
     return fulfilments(db, customer_id, imap, limit=limit)["rows"]
 
 
+_MEMO_PERIOD = re.compile(r"(\d{4}-\d{2}-\d{2})\s*[–\-—to]{1,3}\s*(\d{4}-\d{2}-\d{2})")
+
+
+def _period_from_memo(memo: str | None) -> tuple[date, date] | None:
+    """Pull the billed period out of a NetSuite memo, e.g. '3PL charges 2026-07-27–2026-08-02'."""
+    if not memo:
+        return None
+    m = _MEMO_PERIOD.search(memo)
+    if not m:
+        return None
+    try:
+        return date.fromisoformat(m.group(1)), date.fromisoformat(m.group(2))
+    except ValueError:
+        return None
+
+
+def invoice_periods(db: Session, customer_id: int) -> dict[str, tuple[date, date]]:
+    """ns_invoice_id -> the (start, end) week the invoice bills.
+
+    An invoice's `trandate` is when it was RAISED, not the period it covers — INAU250127 is
+    dated in August and bills 27 Jul–2 Aug. Without this the portal showed a date that
+    answered the wrong question, and there was no way to tell which week an invoice was for.
+
+    Two sources, in order of trust:
+      1. The `billing_run` that pushed it (`ns_invoice_id`) — authoritative, and the period is
+         the run's own, not something parsed out of text.
+      2. The invoice memo, which the portal stamps as '3PL charges <from>–<to>' at create
+         time. This is the only route for an invoice raised by hand in NetSuite, and it's why
+         `createInvoice` writes that memo at all.
+    """
+    out: dict[str, tuple[date, date]] = {}
+    for inv in db.scalars(select(Invoice).where(Invoice.customer_id == customer_id)).all():
+        if (p := _period_from_memo(inv.memo)):
+            out[inv.ns_invoice_id] = p
+    for run in db.scalars(select(BillingRun).where(
+            BillingRun.customer_id == customer_id,
+            BillingRun.ns_invoice_id != None)).all():                # noqa: E711
+        out[run.ns_invoice_id] = (run.period_start, run.period_end)
+    return out
+
+
 def invoices(db: Session, customer_id: int, *, since: date | None = None,
              q: str | None = None, limit: int | None = None, offset: int = 0) -> dict:
     """Invoice headers, newest first. qty_total is the summed invoice amount."""
@@ -352,8 +394,14 @@ def invoices(db: Session, customer_id: int, *, since: date | None = None,
     if limit is not None:
         stmt = stmt.limit(limit).offset(offset)
     rows = db.scalars(stmt).all()
+    periods = invoice_periods(db, customer_id)
+    # `period` is the pair the table renders; period_start/period_end are the same thing
+    # flattened, because the CSV export writes row values straight out and a tuple would
+    # land in Excel as "(datetime.date(...), ...)".
     return {"rows": [{"id": i.id, "tranid": i.tranid, "trandate": i.trandate,
-                      "status": i.status,
+                      "status": i.status, "period": periods.get(i.ns_invoice_id),
+                      "period_start": (periods.get(i.ns_invoice_id) or (None, None))[0],
+                      "period_end": (periods.get(i.ns_invoice_id) or (None, None))[1],
                       "total": float(i.total) if i.total is not None else None}
                      for i in rows],
             "total": agg[0] or 0, "qty_total": float(agg[1] or 0), "docs": agg[0] or 0}
@@ -372,6 +420,14 @@ def invoice_with_lines(db: Session, customer_id: int, invoice_id: int):
              "rate": float(l.rate) if l.rate is not None else None,
              "amount": float(l.amount) if l.amount is not None else None} for l in lines]
     return inv, rows
+
+
+def invoice_period(db: Session, inv: Invoice) -> tuple[date, date] | None:
+    """The week a single invoice bills — the run that pushed it, else its memo."""
+    run = db.scalar(select(BillingRun).where(
+        BillingRun.customer_id == inv.customer_id,
+        BillingRun.ns_invoice_id == inv.ns_invoice_id))
+    return (run.period_start, run.period_end) if run else _period_from_memo(inv.memo)
 
 
 def run_variance(db: Session, run: BillingRun) -> dict | None:

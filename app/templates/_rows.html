@@ -22,6 +22,9 @@
 {%- for r in rows -%}
 <tr class="clickrow" onclick="location.href='/c/{{ customer.slug }}/invoice/{{ r.id }}'">
   <td><a class="id idlink" href="/c/{{ customer.slug }}/invoice/{{ r.id }}">{{ r.tranid }}</a></td><td>{{ r.trandate|dshort }}</td>
+  {# The period BILLED, which is not the invoice date — INAU250127 is raised in August and
+     bills 27 Jul–2 Aug. Comes from the billing run that pushed it, else the NetSuite memo. #}
+  <td>{% if r.period %}{{ r.period[0]|dshort }} – {{ r.period[1]|dshort }}{% else %}<span class="sub2">—</span>{% endif %}</td>
   <td class="r num">${{ r.total|money }}</td><td><span class="chip {{ r.status|chip }}">{{ r.status }}</span></td>
   <td class="r chev noexport">›</td></tr>
 {%- endfor -%}

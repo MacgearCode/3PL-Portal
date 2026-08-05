@@ -253,6 +253,11 @@ class Invoice(Base):
     currency: Mapped[str | None] = mapped_column(String, nullable=True)
     amount_remaining: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
     due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # The invoice's NetSuite memo. The portal stamps "3PL charges <from>–<to>" on every draft
+    # it creates, which is the only field on the NetSuite record saying WHICH WEEK the invoice
+    # bills — trandate is when it was raised, not the period covered. Read as a fallback when
+    # an invoice has no billing_run linked to it (e.g. raised by hand in NetSuite).
+    memo: Mapped[str | None] = mapped_column(String, nullable=True)
     ns_lastmodified: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     synced_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     lines: Mapped[list["InvoiceLine"]] = relationship(

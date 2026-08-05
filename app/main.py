@@ -423,8 +423,9 @@ def portal_export(slug: str, view: str, request: Request, db: Session = Depends(
                           ("Qty", "qty"), ("Date", "trandate")],
         "fulfilments": [("Fulfilment", "tranid"), ("Type", "source"), ("Reference", "ref"),
                         ("SKU", "sku"), ("Qty", "qty"), ("Date", "trandate")],
-        "invoices": [("Invoice", "tranid"), ("Date", "trandate"), ("Amount", "total"),
-                     ("Status", "status")],
+        "invoices": [("Invoice", "tranid"), ("Date raised", "trandate"),
+                     ("Period from", "period_start"), ("Period to", "period_end"),
+                     ("Amount", "total"), ("Status", "status")],
     }[view]
     window = request.query_params.get("window") or service.DEFAULT_WINDOW
     if window not in service.LIST_WINDOWS:
@@ -564,7 +565,8 @@ def invoice_detail(slug: str, invoice_id: int, request: Request, db: Session = D
     ctx.pop("_imap"); ctx.pop("_wk")
     ctx.update(title=f"Invoice {inv.tranid or inv.ns_invoice_id}",
                sub="3PL service charges — line detail",
-               invoice=inv, lines=lines)
+               invoice=inv, lines=lines,
+               invoice_period=service.invoice_period(db, inv))
     return templates.TemplateResponse(request, "portal.html", ctx)
 
 
@@ -803,6 +805,38 @@ async def restore_billing_line(slug: str, run_id: int, request: Request,
     _mark_edited(run, request)
     db.commit()
     return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=line-restored", status_code=303)
+
+
+@app.post("/c/{slug}/billing/delete/{run_id}")
+def delete_billing_run(slug: str, run_id: int, request: Request, db: Session = Depends(get_db)):
+    """Delete a saved billing run and its lines.
+
+    Portal-side only — it never touches NetSuite. An invoice already created there stays
+    exactly where it is; what's removed is the portal's record of the run and, with it, the
+    link between them.
+
+    ⚠️ **Deleting a run that reached NetSuite un-blocks re-billing that week.** The re-billing
+    guard keys on the existence of a run for the period, so once the run is gone the period
+    looks unbilled and can be computed, queued and pushed again — a second invoice for the
+    same week. That is exactly what makes this useful for clearing sandbox leftovers, and
+    exactly what makes it dangerous afterwards, so the template names the invoice in the
+    confirm and the flash says the period is now re-billable.
+
+    Admin-only, unlike the rest of the billing actions: recomputing or closing a period is
+    reversible, this is not.
+    """
+    if not perms.is_admin(cur(request)):
+        return RedirectResponse(f"/c/{slug}/billing?msg=not-allowed", status_code=303)
+    run = db.get(BillingRun, run_id)
+    cust = _get_customer(db, slug)
+    if not cust or not run or run.customer_id != cust.id:
+        return RedirectResponse(f"/c/{slug}/billing?msg=bad-run", status_code=303)
+    qs = f"from={run.period_start}&to={run.period_end}"
+    had_invoice = run.ns_invoice_id
+    db.delete(run)          # lines go with it (cascade="all, delete-orphan")
+    db.commit()
+    msg = "run-deleted-pushed" if had_invoice else "run-deleted"
+    return RedirectResponse(f"/c/{slug}/billing?{qs}&msg={msg}", status_code=303)
 
 
 @app.post("/c/{slug}/billing/lock/{run_id}")

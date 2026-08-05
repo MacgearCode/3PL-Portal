@@ -282,7 +282,10 @@
       <a class="link" href="/c/{{ customer.slug }}/invoices">← All invoices</a>
       <div class="invmeta">
         <div><span class="lab">Invoice</span><b>{{ invoice.tranid or invoice.ns_invoice_id }}</b></div>
-        <div><span class="lab">Date</span><b>{{ invoice.trandate|d }}</b></div>
+        <div><span class="lab">Date raised</span><b>{{ invoice.trandate|d }}</b></div>
+        {# The week actually billed. Distinct from the date raised, and the thing a customer
+           is really asking when they open an invoice. #}
+        <div><span class="lab">Period billed</span><b>{% if invoice_period %}{{ invoice_period[0]|dshort }} – {{ invoice_period[1]|d }}{% else %}—{% endif %}</b></div>
         <div><span class="lab">Status</span><span class="chip {{ invoice.status|chip }}">{{ invoice.status }}</span></div>
         <div><span class="lab">Total (ex GST)</span><b class="num">${{ invoice.total|money }}</b></div>
       </div>
@@ -301,10 +304,10 @@
       <div class="card"><header><h3>Invoices</h3><span class="hint">3PL service charges on your account · click to view detail</span></header>
         {{ pagedtools('invoice') }}
         <div class="tablewrap"><table id="tbl-inv">
-          <thead><tr><th>Invoice</th><th>Date</th><th class="r">Amount</th><th>Status</th><th class="noexport"></th></tr></thead>
+          <thead><tr><th>Invoice</th><th>Date</th><th>Period billed</th><th class="r">Amount</th><th>Status</th><th class="noexport"></th></tr></thead>
           <tbody>{{ R.invoice_rows(rows, customer) }}
-          {% if not rows %}<tr><td class="empty" colspan="5">{{ 'No invoices match that search.' if q else 'No invoices in this period.' }}</td></tr>{% endif %}</tbody>
-          {% if rows %}<tfoot><tr><td colspan="2">{{ total|qty }} invoices</td><td class="r">${{ qty_total|money }}</td><td colspan="2"></td></tr></tfoot>{% endif %}
+          {% if not rows %}<tr><td class="empty" colspan="6">{{ 'No invoices match that search.' if q else 'No invoices in this period.' }}</td></tr>{% endif %}</tbody>
+          {% if rows %}<tfoot><tr><td colspan="3">{{ total|qty }} invoices</td><td class="r">${{ qty_total|money }}</td><td colspan="2"></td></tr></tfoot>{% endif %}
         </table></div>
         {{ loadmore('tbl-inv') }}
       </div>
@@ -331,6 +334,10 @@
                       'already-locked':['warn','This period is closed — its lines are frozen and cannot be recomputed.'],
                       'has-edits':['warn','This draft has been edited by hand. Recomputing it from the rate card would discard those changes — use "Recompute, discarding edits" on the draft if that is what you want.'],
                       'not-editable':['warn','That run is not an editable draft — it has been closed, queued or pushed.'],
+                      'run-deleted':['ok','Billing run deleted. That period is now unbilled and can be computed again.'],
+                      'run-deleted-pushed':['warn','Billing run deleted. It had reached NetSuite — the invoice there is untouched, but the portal no longer knows this period was billed, so it CAN be billed again. Check NetSuite before re-queuing it.'],
+                      'not-allowed':['crit','Deleting a billing run is restricted to admins.'],
+                      'bad-run':['warn','That billing run no longer exists.'],
                       'bad-line':['warn','Could not save that line. Quantity and rate must be numbers, and an added line needs a charge item.'],
                       'no-item':['crit','No NetSuite item is mapped for ' ~ (request.query_params.get('ct') or 'one of the charges') ~ '. Map it in Settings → Charge items, then queue again.'],
                       'no-bill-to':['crit','This customer has no NetSuite customer id set — nothing to invoice against. Set it in Settings → Customers.'],
@@ -545,8 +552,9 @@
               {% elif run.ns_invoice_id %}<span class="sub2">NS #{{ run.ns_invoice_id }} (awaiting sync)</span>
               {% elif run.status == 'ready_to_push' %}<span class="sub2">queued for n8n</span>
               {% else %}<span class="sub2">—</span>{% endif %}</td>
-          <td class="r">{% if run.status == 'draft' %}
+          <td class="r">
             <div class="runacts">
+              {% if run.status == 'draft' %}
               {% if not run.locked_at %}
               <form method="post" action="/c/{{ customer.slug }}/billing/lock/{{ run.id }}">
                 <button class="btn mini" type="submit"
@@ -554,11 +562,27 @@
               {% endif %}
               <form method="post" action="/c/{{ customer.slug }}/billing/push/{{ run.id }}">
                 <button class="btn mini" type="submit">Queue for NetSuite</button></form>
-            </div>
-          {% endif %}</td>
+              {% endif %}
+              {# Admin-only, and available at ANY status — the runs that most need removing are
+                 the sandbox leftovers sitting at 'invoiced'. The confirm spells out the
+                 consequence rather than asking "are you sure": deleting a run that reached
+                 NetSuite makes the period look unbilled to the re-billing guard. #}
+              {% if is_admin %}
+              <form method="post" action="/c/{{ customer.slug }}/billing/delete/{{ run.id }}"
+                    {# forceescape, not just tojson: tojson returns Markup (already "safe"), so a
+                       bare |e is a no-op and its double quotes close this attribute early —
+                       which silently disables the confirm on a destructive action. #}
+                    onsubmit="return confirm({{ (
+                      'Delete billing run #' ~ run.id ~ ' for ' ~ run.period_start ~ ' to ' ~ run.period_end ~ '?\n\n'
+                      ~ ('This run created NetSuite invoice ' ~ run.ns_invoice_id ~ '. That invoice is NOT deleted — but the portal will forget this period was billed, so it can be billed AGAIN. Confirm in NetSuite first.\n\n' if run.ns_invoice_id else '')
+                      ~ 'This cannot be undone from the portal.')|tojson|forceescape }})">
+                <button class="btn mini danger" type="submit"
+                  title="Delete this run from the portal (NetSuite is not touched)">Delete</button></form>
+              {% endif %}
+            </div></td>
         </tr>{% endfor %}</tbody>
       </table></div></div>
-      <p class="note">Queuing marks the run for n8n, which creates a <b>draft</b> invoice in NetSuite via the RESTlet for approval. The portal shows the real invoice (status, edits, payments) once the next sync pulls it back — the app keeps only the link and never calls NetSuite itself.</p>
+      <p class="note">Queuing marks the run for n8n, which creates a <b>draft</b> invoice in NetSuite via the RESTlet for approval. The portal shows the real invoice (status, edits, payments) once the next sync pulls it back — the app keeps only the link and never calls NetSuite itself.{% if is_admin %} <b>Delete</b> removes a run from the portal only — it never deletes anything in NetSuite, and it makes that period billable again.{% endif %}</p>
       {% endif %}
     {% endif %}
     </div>

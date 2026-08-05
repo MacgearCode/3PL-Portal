@@ -48,6 +48,15 @@ push to NetSuite.** Nothing ever posts automatically.
 
 Statuses: `draft → ready_to_push → pushed → invoiced`, with `locked_at` an orthogonal freeze flag.
 
+**Deleting a run** (`POST /c/{slug}/billing/delete/{run_id}`, **admin only**) removes it and its
+lines from the portal at any status. It never touches NetSuite — an invoice already created
+there survives. ⚠️ It also **un-blocks re-billing that week**: the guard keys on a run existing
+for the period, so once deleted the period looks unbilled and can be pushed again, i.e. a
+second invoice. That's what makes it useful for clearing sandbox leftovers and dangerous
+afterwards, hence admin-only, a confirm that names the invoice, and a flash that says the
+period is now re-billable. Every other billing action is internal-role and reversible; this one
+is neither.
+
 ## Draft editing (built 2026-08-05)
 Once a run is saved, the billing page shows **the run's own lines, not a fresh preview** — after
 a push the two routinely differ, and a recomputed preview above the variance table was
@@ -102,6 +111,25 @@ effective-dated rate cards). **A run with an unmapped line is refused at "Queue 
 naming the charge — it used to fail inside n8n overnight as an undefined item id.
 
 ## Invoice sync-back (built 2026-08-05)
+⚠️ **`transactionline` stores a customer invoice's revenue lines as CREDITS**, so `quantity`
+and `netamount` come back **negative** while the header's `foreigntotal` is positive. Every
+line rendered negative under a positive total, and `run_variance()` compared a positive run
+against a negative invoice and called every line "changed". Two-layer fix, both of which
+**negate, never `ABS()`** — a genuine credit line (a discount, a credited container) is stored
+positive, so `ABS()` would flip it into a charge and silently inflate the invoice:
+- The RESTlet selects `-quantity` / `-netamount` (same place the fulfilment ASSET-line sign is
+  normalised — NetSuite storage conventions belong there, not in the app).
+- `netsuite._orient_lines()` flips the whole line SET if it disagrees in direction with the
+  header total. All-or-nothing on the set, so a legitimate credit keeps its opposite sign. It
+  is idempotent, which means the app and RESTlet can be deployed in either order and a
+  corrected feed is never double-flipped.
+
+**An invoice's `trandate` is when it was RAISED, not the week it bills** — `INAU250127` is
+dated 3 Aug and bills 27 Jul–2 Aug. Both invoice views now show **Period billed**, resolved by
+`service.invoice_periods()` from (1) the `billing_run` that pushed it, else (2) the invoice
+memo, which is why `createInvoice` stamps `3PL charges <from>–<to>` on every draft. The CSV
+export carries it as separate `Period from` / `Period to` columns.
+
 Line edits made in NetSuite always reached the cache (`ingest_invoices` rebuilds lines every
 full lane). What was missing was everything that made them *visible*:
 - The RESTlet now returns the line's **item internal id**, plus `currency`,

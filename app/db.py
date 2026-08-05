@@ -69,7 +69,7 @@ def ensure_columns():
                                   "computed_amount": "NUMERIC(14,2)", "ns_item_id": "VARCHAR"},
                  # Richer invoice sync-back (2026-08-05).
                  "invoice": {"currency": "VARCHAR", "amount_remaining": "NUMERIC(14,2)",
-                             "due_date": "DATE"},
+                             "due_date": "DATE", "memo": "VARCHAR"},
                  "invoice_line": {"ns_item_id": "VARCHAR"}}
     insp = inspect(engine)
     with engine.begin() as conn:

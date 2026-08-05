@@ -80,28 +80,44 @@ define(['N/query', 'N/record'], function (query, record) {
     // currency: the push never sets it (NetSuite sources it from the customer record), so
     // pulling it back is the only way a rate-card/invoice currency mismatch is ever visible.
     // amountremaining/duedate carry the payment state the portal shows next to the status.
+    // t.memo carries the period the portal stamped on the draft ("3PL charges <from>-<to>"),
+    // which is the only thing on the NetSuite record that says WHICH WEEK an invoice bills.
     var heads = runSuiteQL(
       "SELECT t.id, t.tranid, t.trandate, BUILTIN.DF(t.status) status, t.foreigntotal total, " +
-      "BUILTIN.DF(t.currency) currency, t.foreignamountunpaid unpaid, t.duedate, " +
+      "BUILTIN.DF(t.currency) currency, t.foreignamountunpaid unpaid, t.duedate, t.memo, " +
       "t.lastmodifieddate " +
       "FROM transaction t WHERE t.type='CustInvc' AND t.entity=" + Number(p.ns_customer_id) +
       itemFilter);
     return heads.map(function (h) {
       // item id (not just its display name) is what lets the app match a line edited in
       // NetSuite back to the billing line that raised it — descriptions get edited too.
+      //
+      // SIGN: transactionline stores a CustInvc's revenue lines from the LEDGER's point of
+      // view — income is a credit, so both `quantity` and `netamount` come back NEGATIVE
+      // (-9 containers, -13500.00) while the header's `foreigntotal` is positive. Unfixed,
+      // every line on the portal's invoice detail rendered negative under a positive total,
+      // and run_variance() compared a positive run against a negative invoice and called
+      // every single line "changed". Negate to get the customer-facing sign.
+      //
+      // NEGATE, do not ABS(): a genuine credit line (a discount, a credited container) is
+      // stored POSITIVE here, so ABS() would flip it to a charge and silently inflate the
+      // invoice. Negation preserves the relative signs, so a discount stays a discount.
+      // Same class of problem as the fulfilment ASSET-line sign below — NetSuite's storage
+      // convention is normalised here in the RESTlet, not in the app.
       var lines = runSuiteQL(
-        "SELECT item, BUILTIN.DF(item) item_name, memo, quantity, rate, netamount " +
+        "SELECT item, BUILTIN.DF(item) item_name, memo, -quantity qty, rate, " +
+        "-netamount amount " +
         "FROM transactionline WHERE transaction=" + Number(h.id) +
         " AND mainline='F' AND taxline='F' ORDER BY linesequencenumber");
       return {
         ns_invoice_id: String(h.id), tranid: h.tranid, trandate: h.trandate,
         status: h.status, total: h.total, currency: h.currency,
-        amount_remaining: h.unpaid, due_date: h.duedate,
+        amount_remaining: h.unpaid, due_date: h.duedate, memo: h.memo,
         ns_lastmodified: h.lastmodifieddate,
         lines: lines.map(function (l) {
           return { ns_item_id: l.item ? String(l.item) : null,
-                   description: l.memo || l.item_name, qty: l.quantity,
-                   rate: l.rate, amount: l.netamount };
+                   description: l.memo || l.item_name, qty: l.qty,
+                   rate: l.rate, amount: l.amount };
         })
       };
     });

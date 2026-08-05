@@ -161,6 +161,10 @@ CREATE TABLE invoice (
     currency            TEXT,
     amount_remaining    NUMERIC(14,2),                  -- foreignamountunpaid
     due_date            DATE,
+    -- NetSuite memo. The portal stamps "3PL charges <from>-<to>" on every draft it creates —
+    -- the only field on the record saying which WEEK is billed (trandate is when it was
+    -- raised). Fallback period source for invoices with no billing_run linked.
+    memo                TEXT,
     ns_lastmodified     TIMESTAMPTZ,
     synced_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );

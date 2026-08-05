@@ -440,6 +440,124 @@ def test_an_invoice_deleted_in_netsuite_flags_the_run_but_never_rolls_its_status
     db.close()
 
 
+def test_ledger_signed_invoice_lines_are_flipped_to_match_the_header():
+    """transactionline stores a CustInvc's revenue lines as credits, so quantity and
+    netamount arrive NEGATIVE under a POSITIVE foreigntotal. Unfixed, the portal showed every
+    line negative beneath a positive total, and run_variance() called every line 'changed'."""
+    db, cust = _fresh()
+    netsuite.ingest(db, cust, "invoices", _invoice_rows(15624.0, [
+        {"ns_item_id": "57082", "description": "Container unload", "qty": -9, "rate": 1500,
+         "amount": -13500},
+        {"ns_item_id": "23560", "description": "Putaway", "qty": -2124, "rate": 1,
+         "amount": -2124}]))
+    lines = {l.ns_item_id: l for l in db.query(InvoiceLine).all()}
+    assert float(lines["57082"].qty) == 9 and float(lines["57082"].amount) == 13500
+    assert float(lines["23560"].qty) == 2124 and float(lines["23560"].amount) == 2124
+    db.close()
+
+
+def test_correctly_signed_lines_are_left_alone():
+    """Idempotence: once the RESTlet negates at source the app must not flip them back."""
+    db, cust = _fresh()
+    netsuite.ingest(db, cust, "invoices", _invoice_rows(13500.0, [
+        {"ns_item_id": "57082", "description": "Container unload", "qty": 9, "rate": 1500,
+         "amount": 13500}]))
+    line = db.query(InvoiceLine).one()
+    assert float(line.qty) == 9 and float(line.amount) == 13500
+    db.close()
+
+
+def test_a_credit_line_keeps_its_opposite_sign():
+    """All-or-nothing on the SET, never per line. A discount is legitimately the opposite
+    sign to its neighbours — normalising line by line would flip it into a charge."""
+    db, cust = _fresh()
+    netsuite.ingest(db, cust, "invoices", _invoice_rows(13000.0, [
+        {"ns_item_id": "57082", "description": "Container unload", "qty": -9, "rate": 1500,
+         "amount": -13500},
+        {"ns_item_id": "23567", "description": "Goodwill credit", "qty": 1, "rate": 500,
+         "amount": 500}]))
+    lines = {l.ns_item_id: float(l.amount) for l in db.query(InvoiceLine).all()}
+    assert lines["57082"] == 13500, "the charge is flipped positive"
+    assert lines["23567"] == -500, "the credit stays a credit"
+    assert round(sum(lines.values()), 2) == 13000.0, "and the set still reconciles to the header"
+    db.close()
+
+
+# --- which week does an invoice bill? ----------------------------------------
+def test_invoice_period_comes_from_the_run_that_pushed_it():
+    """trandate is when the invoice was RAISED, not the week it covers — INAU250127 is dated
+    in August and bills 27 Jul-2 Aug."""
+    db, cust = _fresh()
+    run = _saved_run(db, cust)
+    _push(db, run)
+    netsuite.ingest(db, cust, "invoices", _invoice_rows(100.0, []))
+    inv = db.query(Invoice).one()
+    assert service.invoice_period(db, inv) == (MON, SUN)
+    assert service.invoice_periods(db, cust.id)["90001"] == (MON, SUN)
+    db.close()
+
+
+def test_invoice_period_falls_back_to_the_memo_for_an_unlinked_invoice():
+    """An invoice raised by hand in NetSuite has no billing_run pointing at it. The memo the
+    portal stamps ('3PL charges <from>-<to>') is the only period source left."""
+    db, cust = _fresh()
+    rows = _invoice_rows(100.0, [])
+    rows[0]["memo"] = "3PL charges 2026-07-27–2026-08-02"
+    netsuite.ingest(db, cust, "invoices", rows)
+    inv = db.query(Invoice).one()
+    assert inv.memo == "3PL charges 2026-07-27–2026-08-02"
+    assert service.invoice_period(db, inv) == (date(2026, 7, 27), date(2026, 8, 2))
+    db.close()
+
+
+def test_invoice_with_no_period_anywhere_reports_none_rather_than_guessing():
+    db, cust = _fresh()
+    netsuite.ingest(db, cust, "invoices", _invoice_rows(100.0, []))
+    inv = db.query(Invoice).one()
+    assert service.invoice_period(db, inv) is None
+    db.close()
+
+
+# --- deleting a run ----------------------------------------------------------
+def test_admin_can_delete_a_run_and_the_period_becomes_billable_again():
+    db, cust = _fresh()
+    run = _saved_run(db, cust)
+    run_id = run.id
+    _patch_cur()
+    main.cur = lambda request: User(email="admin@macgeargroup.com", role="admin",
+                                    password_hash="x", active=True)
+    resp = main.delete_billing_run("mova", run_id, _FakeRequest(), db)
+    assert "msg=run-deleted" in resp.headers["location"]
+    assert db.get(BillingRun, run_id) is None
+    assert not db.query(BillingLine).filter(BillingLine.billing_run_id == run_id).count(), \
+        "lines go with the run"
+    assert main._existing_run(db, cust.id, MON, SUN) is None
+    db.close()
+
+
+def test_deleting_a_pushed_run_warns_that_the_week_can_be_billed_twice():
+    db, cust = _fresh()
+    run = _saved_run(db, cust)
+    _push(db, run)
+    main.cur = lambda request: User(email="admin@macgeargroup.com", role="admin",
+                                    password_hash="x", active=True)
+    resp = main.delete_billing_run("mova", run.id, _FakeRequest(), db)
+    assert "msg=run-deleted-pushed" in resp.headers["location"], \
+        "the flash must say the NetSuite invoice survives and the period is re-billable"
+    db.close()
+
+
+def test_a_non_admin_cannot_delete_a_run():
+    """Recomputing or closing a period is reversible; this is not."""
+    db, cust = _fresh()
+    run = _saved_run(db, cust)
+    _patch_cur()                       # role 'internal'
+    resp = main.delete_billing_run("mova", run.id, _FakeRequest(), db)
+    assert "msg=not-allowed" in resp.headers["location"]
+    assert db.get(BillingRun, run.id) is not None
+    db.close()
+
+
 def test_an_empty_invoice_pull_deletes_nothing():
     """THE guard. A missing transaction permission does not error in NetSuite — it
     row-filters and returns an empty result set from a successful query. Without this, one

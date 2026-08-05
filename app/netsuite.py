@@ -111,22 +111,58 @@ def ingest_invoices(db: Session, c: Customer, rows: list[dict]) -> int:
                       trandate=_date(r.get("trandate")), status=r.get("status"),
                       total=_num(r.get("total")), currency=r.get("currency"),
                       amount_remaining=_num(r.get("amount_remaining")),
-                      due_date=_date(r.get("due_date")),
+                      due_date=_date(r.get("due_date")), memo=r.get("memo"),
                       ns_lastmodified=_datetime(r.get("ns_lastmodified")),
                       synced_at=datetime.utcnow())
         db.flush()
         for l in list(inv.lines):
             db.delete(l)
-        for ln in r.get("lines", []):
-            ns_item = str(ln["ns_item_id"]) if ln.get("ns_item_id") else None
-            db.add(InvoiceLine(invoice_id=inv.id, ns_item_id=ns_item,
-                               charge_type=by_item.get(ns_item),
-                               description=ln.get("description"), qty=_num(ln.get("qty")),
-                               rate=_num(ln.get("rate")), amount=_num(ln.get("amount"))))
+        lines = [{"ns_item_id": str(ln["ns_item_id"]) if ln.get("ns_item_id") else None,
+                  "description": ln.get("description"), "qty": _num(ln.get("qty")),
+                  "rate": _num(ln.get("rate")), "amount": _num(ln.get("amount"))}
+                 for ln in r.get("lines", [])]
+        for ln in _orient_lines(lines, _num(r.get("total"))):
+            db.add(InvoiceLine(invoice_id=inv.id, ns_item_id=ln["ns_item_id"],
+                               charge_type=by_item.get(ln["ns_item_id"]),
+                               description=ln["description"], qty=ln["qty"],
+                               rate=ln["rate"], amount=ln["amount"]))
     db.flush()
     _prune_invoices(db, c, {str(r["ns_invoice_id"]) for r in rows})
     _advance_pushed_runs(db, c)
     return len(rows)
+
+
+def _orient_lines(lines: list[dict], header_total: float | None) -> list[dict]:
+    """Make invoice line signs agree with the invoice header, flipping the whole set if not.
+
+    `transactionline` stores a customer invoice's revenue lines from the LEDGER's point of
+    view — income is a credit — so `quantity` and `netamount` come back NEGATIVE while the
+    header's `foreigntotal` is positive. The portal rendered every line negative under a
+    positive total, and run_variance() compared a positive run against a negative invoice and
+    called every line "changed".
+
+    The RESTlet now negates at source. This is the belt-and-braces half, and it earns its
+    keep three ways: it fixes the data on the next sync WITHOUT waiting for a RESTlet
+    redeploy, it makes the deploy order of app-vs-RESTlet irrelevant, and it is idempotent —
+    once the signs agree it does nothing, so it cannot double-flip a corrected feed.
+
+    Deliberately all-or-nothing on the SET, never per line: a genuine credit line (a
+    discount, a credited container) is legitimately the opposite sign to its neighbours, and
+    normalising line by line would flip it into a charge and silently inflate the invoice.
+    """
+    amounts = [l["amount"] for l in lines if l["amount"] is not None]
+    if not amounts or header_total in (None, 0):
+        return lines
+    line_sum = sum(amounts)
+    # Only act when the two genuinely disagree in direction. An invoice whose lines net to
+    # zero tells us nothing, so leave it alone.
+    if line_sum == 0 or (line_sum > 0) == (header_total > 0):
+        return lines
+    for l in lines:
+        for k in ("qty", "amount"):
+            if l[k] is not None:
+                l[k] = -l[k]
+    return lines
 
 
 def _prune_invoices(db: Session, c: Customer, seen: set[str]) -> None:
