@@ -165,6 +165,12 @@ CREATE TABLE invoice (
     -- the only field on the record saying which WEEK is billed (trandate is when it was
     -- raised). Fallback period source for invoices with no billing_run linked.
     memo                TEXT,
+    -- Period billed, assigned BY HAND in the portal. PORTAL-OWNED: the sync never writes
+    -- these, so an assignment survives every re-sync. Needed because an invoice raised
+    -- manually in NetSuite carries its period nowhere — trandate is the raise date and may be
+    -- deliberately backdated to fall inside payment terms.
+    period_start        DATE,
+    period_end          DATE,
     ns_lastmodified     TIMESTAMPTZ,
     synced_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );

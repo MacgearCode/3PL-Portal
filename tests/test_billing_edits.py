@@ -492,7 +492,7 @@ def test_invoice_period_comes_from_the_run_that_pushed_it():
     _push(db, run)
     netsuite.ingest(db, cust, "invoices", _invoice_rows(100.0, []))
     inv = db.query(Invoice).one()
-    assert service.invoice_period(db, inv) == (MON, SUN)
+    assert service.invoice_period(db, inv) == ((MON, SUN), "run", (MON, SUN))
     assert service.invoice_periods(db, cust.id)["90001"] == (MON, SUN)
     db.close()
 
@@ -506,15 +506,98 @@ def test_invoice_period_falls_back_to_the_memo_for_an_unlinked_invoice():
     netsuite.ingest(db, cust, "invoices", rows)
     inv = db.query(Invoice).one()
     assert inv.memo == "3PL charges 2026-07-27–2026-08-02"
-    assert service.invoice_period(db, inv) == (date(2026, 7, 27), date(2026, 8, 2))
+    assert service.invoice_period(db, inv) == ((date(2026, 7, 27), date(2026, 8, 2)),
+                                               "memo", None)
     db.close()
 
 
 def test_invoice_with_no_period_anywhere_reports_none_rather_than_guessing():
+    """Never infer the period from trandate. INAU250127 was backdated to 31 Jul to fall inside
+    payment terms while billing 27 Jul-2 Aug — a guess off trandate would file it in the
+    wrong week and look authoritative doing it."""
     db, cust = _fresh()
     netsuite.ingest(db, cust, "invoices", _invoice_rows(100.0, []))
     inv = db.query(Invoice).one()
-    assert service.invoice_period(db, inv) is None
+    assert service.invoice_period(db, inv) == (None, None, None)
+    assert service.invoice_periods(db, cust.id) == {}
+    db.close()
+
+
+def test_a_period_can_be_assigned_by_hand_and_snaps_to_a_whole_week():
+    """The case that matters: INAU249588 and INAU250127 were raised manually in NetSuite, so
+    they have no run and no memo. Hand assignment is the only period they will ever have."""
+    db, cust = _fresh()
+    netsuite.ingest(db, cust, "invoices", _invoice_rows(100.0, []))
+    inv = db.query(Invoice).one()
+    _patch_cur()
+    # A Thursday inside the 27 Jul - 2 Aug week; must snap to Mon-Sun.
+    asyncio.run(main.set_invoice_period("mova", inv.id, _FakeRequest({"week": "2026-07-30"}), db))
+    assert (inv.period_start, inv.period_end) == (date(2026, 7, 27), date(2026, 8, 2))
+    period, source, _ = service.invoice_period(db, inv)
+    assert period == (date(2026, 7, 27), date(2026, 8, 2)) and source == "manual"
+    db.close()
+
+
+def test_a_hand_assigned_period_survives_a_re_sync():
+    """period_start/end are portal-owned. If the invoice ingest ever wrote them, the next
+    sync would silently wipe every manual attribution."""
+    db, cust = _fresh()
+    netsuite.ingest(db, cust, "invoices", _invoice_rows(100.0, []))
+    inv = db.query(Invoice).one()
+    _patch_cur()
+    asyncio.run(main.set_invoice_period("mova", inv.id, _FakeRequest({"week": "2026-07-20"}), db))
+
+    netsuite.ingest(db, cust, "invoices", _invoice_rows(250.0, [
+        {"ns_item_id": "23560", "description": "Putaway", "qty": 250, "rate": 1, "amount": 250}]))
+    db.refresh(inv)
+    assert float(inv.total) == 250.0, "the sync did update what it owns"
+    assert (inv.period_start, inv.period_end) == (MON, SUN), "...and left what it doesn't alone"
+    db.close()
+
+
+def test_a_hand_assigned_period_overrides_the_run_and_the_disagreement_is_visible():
+    db, cust = _fresh()
+    run = _saved_run(db, cust)          # period MON..SUN (20-26 Jul)
+    _push(db, run)
+    netsuite.ingest(db, cust, "invoices", _invoice_rows(100.0, []))
+    inv = db.query(Invoice).one()
+    assert service.invoice_period(db, inv)[1] == "run"
+
+    _patch_cur()
+    asyncio.run(main.set_invoice_period("mova", inv.id, _FakeRequest({"week": "2026-07-29"}), db))
+    period, source, run_period = service.invoice_period(db, inv)
+    assert source == "manual" and period == (date(2026, 7, 27), date(2026, 8, 2))
+    assert run_period == (MON, SUN), \
+        "the run's own period is returned too, so the page can flag the disagreement"
+    db.close()
+
+
+def test_clearing_a_hand_assigned_period_falls_back_to_the_memo():
+    db, cust = _fresh()
+    rows = _invoice_rows(100.0, [])
+    rows[0]["memo"] = "3PL charges 2026-07-20–2026-07-26"
+    netsuite.ingest(db, cust, "invoices", rows)
+    inv = db.query(Invoice).one()
+    _patch_cur()
+    asyncio.run(main.set_invoice_period("mova", inv.id, _FakeRequest({"week": "2026-08-05"}), db))
+    assert service.invoice_period(db, inv)[1] == "manual"
+
+    asyncio.run(main.set_invoice_period("mova", inv.id, _FakeRequest({"clear": "1"}), db))
+    period, source, _ = service.invoice_period(db, inv)
+    assert source == "memo" and period == (MON, SUN)
+    assert inv.period_start is None and inv.period_end is None
+    db.close()
+
+
+def test_an_unreadable_week_is_refused_rather_than_stored():
+    db, cust = _fresh()
+    netsuite.ingest(db, cust, "invoices", _invoice_rows(100.0, []))
+    inv = db.query(Invoice).one()
+    _patch_cur()
+    for form in ({"week": "not-a-date"}, {"week": ""}, {}):
+        resp = asyncio.run(main.set_invoice_period("mova", inv.id, _FakeRequest(form), db))
+        assert "msg=bad-week" in resp.headers["location"]
+    assert inv.period_start is None
     db.close()
 
 

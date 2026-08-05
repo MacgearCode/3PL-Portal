@@ -68,8 +68,11 @@ def ensure_columns():
                                   "computed_rate": "NUMERIC(12,2)",
                                   "computed_amount": "NUMERIC(14,2)", "ns_item_id": "VARCHAR"},
                  # Richer invoice sync-back (2026-08-05).
+                 # period_start/end are PORTAL-OWNED (a hand-assigned billed period) — the
+                 # invoice sync must never write them, or a re-sync would wipe the assignment.
                  "invoice": {"currency": "VARCHAR", "amount_remaining": "NUMERIC(14,2)",
-                             "due_date": "DATE", "memo": "VARCHAR"},
+                             "due_date": "DATE", "memo": "VARCHAR",
+                             "period_start": "DATE", "period_end": "DATE"},
                  "invoice_line": {"ns_item_id": "VARCHAR"}}
     insp = inspect(engine)
     with engine.begin() as conn:

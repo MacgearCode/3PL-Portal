@@ -258,6 +258,13 @@ class Invoice(Base):
     # bills — trandate is when it was raised, not the period covered. Read as a fallback when
     # an invoice has no billing_run linked to it (e.g. raised by hand in NetSuite).
     memo: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Period billed, assigned BY HAND in the portal. NetSuite has no field for it, so an
+    # invoice raised manually there (rather than pushed from a billing run) carries no period
+    # anywhere — not in trandate, which is the raise date and may be deliberately backdated to
+    # land inside payment terms. These are portal-owned columns: the sync never writes them,
+    # so a manual assignment survives every re-sync.
+    period_start: Mapped[date | None] = mapped_column(Date, nullable=True)
+    period_end: Mapped[date | None] = mapped_column(Date, nullable=True)
     ns_lastmodified: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     synced_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     lines: Mapped[list["InvoiceLine"]] = relationship(

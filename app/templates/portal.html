@@ -280,15 +280,45 @@
 
     {% elif view == "invoices" and invoice %}
       <a class="link" href="/c/{{ customer.slug }}/invoices">← All invoices</a>
+      {% set iflash = {'period-set':['ok','Period billed assigned. It is stored in the portal and will survive every NetSuite re-sync.'],
+                       'period-cleared':['ok','Manual period removed — falling back to the billing run or invoice memo, if either has one.'],
+                       'bad-week':['warn','Pick a date inside the week the invoice bills.']}.get(msg) %}
+      {% if iflash %}<div class="flash {{ iflash[0] }}">{{ iflash[1] }}</div>{% endif %}
       <div class="invmeta">
         <div><span class="lab">Invoice</span><b>{{ invoice.tranid or invoice.ns_invoice_id }}</b></div>
+        {# trandate is when the invoice was RAISED and may be deliberately backdated to land
+           inside payment terms, so it can never stand in for the period billed. #}
         <div><span class="lab">Date raised</span><b>{{ invoice.trandate|d }}</b></div>
-        {# The week actually billed. Distinct from the date raised, and the thing a customer
-           is really asking when they open an invoice. #}
-        <div><span class="lab">Period billed</span><b>{% if invoice_period %}{{ invoice_period[0]|dshort }} – {{ invoice_period[1]|d }}{% else %}—{% endif %}</b></div>
+        <div><span class="lab">Period billed</span><b>{% if invoice_period %}{{ invoice_period[0]|dshort }} – {{ invoice_period[1]|d }}{% else %}<span class="sub2">not set</span>{% endif %}</b>
+          {% if period_source == 'manual' %}<span class="sub2">assigned manually</span>
+          {% elif period_source == 'run' %}<span class="sub2">from billing run</span>
+          {% elif period_source == 'memo' %}<span class="sub2">from NetSuite memo</span>{% endif %}</div>
         <div><span class="lab">Status</span><span class="chip {{ invoice.status|chip }}">{{ invoice.status }}</span></div>
         <div><span class="lab">Total (ex GST)</span><b class="num">${{ invoice.total|money }}</b></div>
       </div>
+      {# A hand-assigned period that disagrees with the run that created the invoice is
+         surfaced, never silently applied — one of the two is wrong. #}
+      {% if period_source == 'manual' and run_period and run_period != invoice_period %}
+      <div class="flash warn">The period assigned here ({{ invoice_period[0]|dshort }} – {{ invoice_period[1]|dshort }})
+        differs from the billing run that created this invoice ({{ run_period[0]|dshort }} – {{ run_period[1]|dshort }}).
+        The assigned period is being shown. Clear it below to fall back to the run.</div>
+      {% endif %}
+      {% if is_internal %}
+      {# Macgear-internal. NetSuite has no billed-period field, so an invoice raised by hand
+         there has no period anywhere — this is the only way to attribute one. #}
+      <div class="card invperiod">
+        <form class="frow" method="post" action="/c/{{ customer.slug }}/invoice/{{ invoice.id }}/period">
+          <label>{{ 'Change the period billed' if period_source == 'manual' else 'Assign the period billed' }}
+            <input type="date" name="week" value="{{ invoice_period[0] if invoice_period else '' }}" required>
+            <span class="sub2">Any date in the week — it snaps to that Monday–Sunday.</span></label>
+          <button class="btn" type="submit">Save period</button>
+          {% if invoice.period_start %}
+          <button class="btn" type="submit" name="clear" value="1"
+                  formnovalidate title="Fall back to the billing run or memo">Clear</button>
+          {% endif %}
+        </form>
+      </div>
+      {% endif %}
       <div class="card"><header><h3>What was charged</h3><span class="hint">3PL service charge lines</span></header>
         <div class="tablewrap"><table>
           <thead><tr><th>Charge</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead>

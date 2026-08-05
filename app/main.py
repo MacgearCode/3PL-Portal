@@ -563,11 +563,51 @@ def invoice_detail(slug: str, invoice_id: int, request: Request, db: Session = D
         return RedirectResponse(f"/c/{slug}/invoices", status_code=303)
     ctx = _portal_ctx(request, db, cust, "invoices")
     ctx.pop("_imap"); ctx.pop("_wk")
+    period, source, run_period = service.invoice_period(db, inv)
     ctx.update(title=f"Invoice {inv.tranid or inv.ns_invoice_id}",
                sub="3PL service charges — line detail",
-               invoice=inv, lines=lines,
-               invoice_period=service.invoice_period(db, inv))
+               invoice=inv, lines=lines, invoice_period=period,
+               period_source=source, run_period=run_period,
+               msg=request.query_params.get("msg", ""))
     return templates.TemplateResponse(request, "portal.html", ctx)
+
+
+@app.post("/c/{slug}/invoice/{invoice_id}/period")
+async def set_invoice_period(slug: str, invoice_id: int, request: Request,
+                             db: Session = Depends(get_db)):
+    """Assign (or clear) the week an invoice bills, by hand.
+
+    NetSuite has no field for the billed period, so an invoice raised manually there carries
+    it nowhere: `trandate` is the raise date, and INAU250127 shows why that can't stand in for
+    it — it was backdated to 31 Jul to fall inside payment terms while billing 27 Jul–2 Aug.
+
+    Snapped to a whole Monday–Sunday week from whatever date is submitted, the same rule the
+    billing period picker uses (`_billing_period`). Billing is priced in whole weeks
+    throughout, so an invoice attributed to a ragged range could never line up with a run.
+
+    Macgear-internal only — it's an attribution the customer reads, not one they set. Stored
+    on portal-owned columns the sync never writes, so it survives every re-sync.
+    """
+    user = cur(request)
+    cust = _get_customer(db, slug)
+    if not cust or not perms.is_internal(user):
+        return RedirectResponse("/", status_code=303)
+    inv = db.get(Invoice, invoice_id)
+    if not inv or inv.customer_id != cust.id:
+        return RedirectResponse(f"/c/{slug}/invoices", status_code=303)
+    form = await request.form()
+    back = f"/c/{slug}/invoice/{invoice_id}"
+    if form.get("clear") is not None:
+        inv.period_start = inv.period_end = None
+        db.commit()
+        return RedirectResponse(f"{back}?msg=period-cleared", status_code=303)
+    try:
+        anchor = date.fromisoformat(form["week"])
+    except (KeyError, TypeError, ValueError):
+        return RedirectResponse(f"{back}?msg=bad-week", status_code=303)
+    inv.period_start, inv.period_end = service.week_bounds(anchor)
+    db.commit()
+    return RedirectResponse(f"{back}?msg=period-set", status_code=303)
 
 
 def _existing_run(db: Session, customer_id: int, ps: date, pe: date) -> BillingRun | None:

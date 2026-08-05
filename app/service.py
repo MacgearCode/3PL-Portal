@@ -352,28 +352,45 @@ def _period_from_memo(memo: str | None) -> tuple[date, date] | None:
 
 
 def invoice_periods(db: Session, customer_id: int) -> dict[str, tuple[date, date]]:
-    """ns_invoice_id -> the (start, end) week the invoice bills.
-
-    An invoice's `trandate` is when it was RAISED, not the period it covers — INAU250127 is
-    dated in August and bills 27 Jul–2 Aug. Without this the portal showed a date that
-    answered the wrong question, and there was no way to tell which week an invoice was for.
-
-    Two sources, in order of trust:
-      1. The `billing_run` that pushed it (`ns_invoice_id`) — authoritative, and the period is
-         the run's own, not something parsed out of text.
-      2. The invoice memo, which the portal stamps as '3PL charges <from>–<to>' at create
-         time. This is the only route for an invoice raised by hand in NetSuite, and it's why
-         `createInvoice` writes that memo at all.
-    """
+    """ns_invoice_id -> the (start, end) week the invoice bills. See _resolve_period()."""
+    runs = {r.ns_invoice_id: (r.period_start, r.period_end) for r in db.scalars(
+        select(BillingRun).where(BillingRun.customer_id == customer_id,
+                                 BillingRun.ns_invoice_id != None)).all()}   # noqa: E711
     out: dict[str, tuple[date, date]] = {}
     for inv in db.scalars(select(Invoice).where(Invoice.customer_id == customer_id)).all():
-        if (p := _period_from_memo(inv.memo)):
+        p, _ = _resolve_period(inv, runs.get(inv.ns_invoice_id))
+        if p:
             out[inv.ns_invoice_id] = p
-    for run in db.scalars(select(BillingRun).where(
-            BillingRun.customer_id == customer_id,
-            BillingRun.ns_invoice_id != None)).all():                # noqa: E711
-        out[run.ns_invoice_id] = (run.period_start, run.period_end)
     return out
+
+
+def _resolve_period(inv: Invoice, run_period: tuple[date, date] | None):
+    """(period, source) for one invoice, or (None, None).
+
+    An invoice's `trandate` is when it was RAISED, not the period it covers — INAU250127 is
+    dated 31 Jul (deliberately backdated to fall inside payment terms) and bills 27 Jul–2 Aug.
+    Nothing here ever infers a period from trandate, and nothing should: a backdate would
+    silently move an invoice into the wrong week.
+
+    Three sources, in order of trust:
+      1. **Assigned by hand in the portal** (`invoice.period_start/end`). A deliberate human
+         statement, so it wins — including over a linked run, because the only reason to set
+         it on an invoice that already has one is to correct it. The UI flags the disagreement
+         rather than hiding it.
+      2. The `billing_run` that pushed it — authoritative for anything the portal created, and
+         it's the run's own period, not something parsed out of text.
+      3. The invoice memo, which the portal stamps as '3PL charges <from>–<to>' at create
+         time. This is why `createInvoice` writes that memo at all.
+
+    Invoices raised manually in NetSuite have none of 2 or 3, which is what 1 exists for.
+    """
+    if inv.period_start and inv.period_end:
+        return (inv.period_start, inv.period_end), "manual"
+    if run_period:
+        return run_period, "run"
+    if (p := _period_from_memo(inv.memo)):
+        return p, "memo"
+    return None, None
 
 
 def invoices(db: Session, customer_id: int, *, since: date | None = None,
@@ -422,12 +439,18 @@ def invoice_with_lines(db: Session, customer_id: int, invoice_id: int):
     return inv, rows
 
 
-def invoice_period(db: Session, inv: Invoice) -> tuple[date, date] | None:
-    """The week a single invoice bills — the run that pushed it, else its memo."""
+def invoice_period(db: Session, inv: Invoice):
+    """(period, source, run_period) for one invoice — see _resolve_period().
+
+    `run_period` is returned alongside so the invoice page can say when a hand-assigned
+    period disagrees with the run that created the invoice, instead of quietly overriding it.
+    """
     run = db.scalar(select(BillingRun).where(
         BillingRun.customer_id == inv.customer_id,
         BillingRun.ns_invoice_id == inv.ns_invoice_id))
-    return (run.period_start, run.period_end) if run else _period_from_memo(inv.memo)
+    run_period = (run.period_start, run.period_end) if run else None
+    period, source = _resolve_period(inv, run_period)
+    return period, source, run_period
 
 
 def run_variance(db: Session, run: BillingRun) -> dict | None:

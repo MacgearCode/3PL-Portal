@@ -124,11 +124,23 @@ positive, so `ABS()` would flip it into a charge and silently inflate the invoic
   is idempotent, which means the app and RESTlet can be deployed in either order and a
   corrected feed is never double-flipped.
 
-**An invoice's `trandate` is when it was RAISED, not the week it bills** — `INAU250127` is
-dated 3 Aug and bills 27 Jul–2 Aug. Both invoice views now show **Period billed**, resolved by
-`service.invoice_periods()` from (1) the `billing_run` that pushed it, else (2) the invoice
-memo, which is why `createInvoice` stamps `3PL charges <from>–<to>` on every draft. The CSV
-export carries it as separate `Period from` / `Period to` columns.
+**An invoice's `trandate` is when it was RAISED, not the week it bills.** `INAU250127` bills
+27 Jul–2 Aug and was **deliberately backdated to 31 Jul** to fall inside payment terms — so
+never infer a period from `trandate`, in code or by eye. Both invoice views show **Period
+billed**, resolved by `service._resolve_period()` in this order:
+1. **`invoice.period_start/end` — assigned by hand in the portal.** PORTAL-OWNED columns: the
+   sync never writes them, so an assignment survives every re-sync. Internal-only form on the
+   invoice page; snaps any submitted date to its Mon–Sun week (billing is priced in whole
+   weeks everywhere, so a ragged range could never line up with a run). Wins over a linked
+   run — the only reason to set it on an invoice that has one is to correct it — and the page
+   **flags the disagreement** rather than hiding it.
+2. The `billing_run` that pushed it.
+3. The invoice memo, which is why `createInvoice` stamps `3PL charges <from>–<to>`.
+
+NetSuite has **no billed-period field**, so 1 is the only period an invoice raised by hand
+there will ever have (`INAU249588` = 20–26 Jul, `INAU250127` = 27 Jul–2 Aug were both entered
+this way). Invoices pushed from the portal get 2 and 3 for free. CSV export carries the period
+as separate `Period from` / `Period to` columns.
 
 Line edits made in NetSuite always reached the cache (`ingest_invoices` rebuilds lines every
 full lane). What was missing was everything that made them *visible*:
