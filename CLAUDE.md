@@ -22,10 +22,13 @@ shrinkage). Storage at 1,112 pallets is **$5,004/week**.
 hold no stock yet, but the moment they receive they contribute **0 pallets** to storage. Populate
 the field in NetSuite before that batch lands.
 
-**Remaining work: the billing write path** — see *Billing roadmap* below. Reads are done; the
-draft-invoice push is not yet configured (needs the 3PL billing customer record + `CHARGE_ITEMS`
-mapped to production items, `docs/production_cutover.md` §1). "Queue for NetSuite" will error
-until those land. Skriva remains live as the reference customer.
+**Billing write path — configured 2026-08-05, not yet fired in anger.** The two blockers in
+`docs/production_cutover.md` §1 are resolved: the bill-to is **customer `11066` — Spacewalker
+Technology Hong Kong Co., Limited** (`03431`), Mova's HK entity, currency **AUD**; and the
+charge items are mapped to production ids in the app (Settings → **Charge items**), replacing
+the sandbox `CHARGE_ITEMS` map that used to sit in the n8n node. Set `11066` on Mova in
+`/admin/customers` and redeploy the RESTlet, then the first real push can go. Skriva remains
+live as the reference customer.
 
 ## Billing roadmap (built 2026-08-01)
 Shape: **whole Mon–Sun period → auto-generate the draft at period end → review → close → manual
@@ -39,9 +42,91 @@ push to NetSuite.** Nothing ever posts automatically.
 | **Week-aligned periods** — the UI submits `?week=<any date>` and snaps to that Mon–Sun week; a hand-edited `?from=/?to=` that isn't a whole week is **rejected with a message**, never silently snapped. A non-week POST is refused (`msg=bad-period`) | ✅ built |
 | **Explicit period close** — `billing_run.locked_at` / `locked_by`, "Close period" on a draft. A closed run **can still be queued and pushed**; what it cannot do is be recomputed, by a re-save or by the scheduled generate | ✅ built |
 | **Auto-generate the draft at period end** — `POST /admin/billing/generate` (token-authed), called at the END of the n8n full lane. Targets `week_bounds(today − 7d)` = the most recently completed week; idempotent (existing run → skipped, never recomputed); plants nothing when there's no billable activity; lands at `draft` | ✅ built |
-| **Edit the draft before pushing** | Decided: **NetSuite-side only.** Lines are editable on the draft invoice in NS after it's created. The portal's numbers stay a faithful record of what the rate card produced — don't add portal-side line editing without revisiting this. |
+| **Edit the draft before pushing** | ✅ built 2026-08-05 — **reverses the earlier "NetSuite-side only" decision**, which two weeks of live 3PL work made untenable. See *Draft editing* below. |
+| **Charge items live in the app** (`charge_item`, Settings → Charge items) | ✅ built 2026-08-05 — retired the `CHARGE_ITEMS` constant in the n8n node |
+| **Invoice edits sync back with a variance** | ✅ built 2026-08-05 — see *Invoice sync-back* below |
 
 Statuses: `draft → ready_to_push → pushed → invoiced`, with `locked_at` an orthogonal freeze flag.
+
+## Draft editing (built 2026-08-05)
+Once a run is saved, the billing page shows **the run's own lines, not a fresh preview** — after
+a push the two routinely differ, and a recomputed preview above the variance table was
+misleading on the screen people reconcile invoices against. While it's an open draft the lines
+are editable: change qty/rate, remove a line, or add an ad-hoc charge off the item catalogue.
+
+The property the old "NetSuite-side only" rule protected — *the run is a faithful record of what
+the rate card produced* — is now enforced structurally rather than by convention:
+- **`computed_qty` / `computed_rate` / `computed_amount` are never overwritten by an edit.**
+  `qty`/`rate`/`amount` are what gets invoiced; the computed trio is what the engine said. The
+  difference shows as a per-line variance and in the "Rate card" column.
+- **A removed COMPUTED line is kept at `origin='removed'`, amount 0** — struck through, with a
+  Restore button — never deleted. A manual line *is* deleted, since nothing computed is being
+  hidden. A charge that silently disappears is the exact fault that put 9 containers ($13,500)
+  off an invoice for a fortnight.
+- **A hand-edited draft cannot be silently recomputed.** `_recompute_blocked()` gains a third
+  reason, `has-edits`; only an explicit "Recompute, discarding edits" (with a confirm) lifts it,
+  and it never unlocks a closed or pushed period. The scheduled generate skips existing runs
+  anyway.
+- Editing is refused outright on a closed or pushed run — that's what "Close period" is for.
+
+**Ad-hoc charges are deliberately NOT wired into the billing engine.** The rate card automates
+five charges; the account carries ten items (kitting, packaging, freight, system fee, additional
+labour, pick/pack). Nothing in the cache derives those, so there is nothing to automate — they
+are entered per week by a human against the item they invoice against. Don't "finish the job" by
+adding them to `billing.py`.
+
+## Charge items (built 2026-08-05)
+`charge_item` is the app's copy of Macgear's `3PL - *` NetSuite service items, managed at
+**Settings → Charge items**. It replaced the `CHARGE_ITEMS` map hardcoded in the n8n Code node,
+which held **sandbox ids `55070–55074` that do not exist in production** — a standing cutover
+trap that made "go to production" mean "edit the workflow". Two reasons it had to move app-side:
+n8n cannot supply a per-line item for an ad-hoc charge, and the mapping is a business decision
+that belongs in a UI.
+
+| charge_type | Item | id |
+|---|---|---|
+| `container_unload` | 3PL - container unload | `57082` |
+| `putaway` | 3PL - Putaway Fee | `23560` |
+| `storage` | 3PL - Storage | `23561` |
+| `picking_so` **and** `picking_vrma` | 3PL - Picking | `23563` |
+| `shipping` | 3PL - Freight | `23565` |
+
+Ad-hoc only: Pick/Pack `36281`, Kitting `23562`, Packaging `23564`, System Fee `23566`,
+Additional Labour `23567`. `picking_vrma` reaches `23563` through `service.CHARGE_TYPE_ALIASES`
+rather than a duplicate row — picking bills at $1.00/unit whichever dispatch path was used, so
+it's one invoice line; the portal splits the two because the split says which path was taken.
+
+Lines are stamped with their item **at save time**, not at push time, so a run pushed months
+later invoices against the item that was mapped when it was billed (same reasoning as
+effective-dated rate cards). **A run with an unmapped line is refused at "Queue for NetSuite"**,
+naming the charge — it used to fail inside n8n overnight as an undefined item id.
+
+## Invoice sync-back (built 2026-08-05)
+Line edits made in NetSuite always reached the cache (`ingest_invoices` rebuilds lines every
+full lane). What was missing was everything that made them *visible*:
+- The RESTlet now returns the line's **item internal id**, plus `currency`,
+  `foreignamountunpaid`, `duedate` and `lastmodifieddate`. `InvoiceLine.charge_type` is derived
+  from the item through `charge_item` — **matching on item, never description**, because
+  descriptions are free text and get edited too.
+- `service.run_variance()` compares a pushed run to its invoice line by line and renders a panel
+  on the billing page: changed / added-in-NetSuite / not-on-the-invoice, with a total delta.
+  **The run's own lines are never overwritten by it** — NetSuite is truth for what was billed,
+  the run stays the record of what Macgear asked for.
+- **`pushed → invoiced` now actually happens.** Nothing set `invoiced` before except `seed.py`,
+  so every real run sat at `pushed` forever. `_advance_pushed_runs()` moves it once the synced
+  invoice leaves a pending-approval/rejected state.
+- Invoices are **pruned** when NetSuite stops returning them (this also finally clears the stale
+  sandbox invoice, `production_cutover.md` §2a — `invoice` was upsert-only and could not clear
+  itself). ⚠️ **The prune is guarded on a non-empty pull and must stay that way.** A missing
+  transaction permission returns an empty result set from a *successful* query, so an unguarded
+  prune would wipe every invoice and detach every run from the invoice it created — one re-push
+  away from double-billing. A run whose invoice vanishes gets `sync_note` and keeps its status;
+  re-billing a week is a human decision, never a sync side effect.
+- **Invoice-view filtering**: `customer.invoice_items_only` narrows the invoice read to invoices
+  carrying a 3PL charge item. Needed because Mova bills to `11066`, an existing trading entity —
+  without it, Spacewalker's ordinary product invoices would appear in Mova's customer portal.
+  Leave it **off** for Skriva, whose 3PL invoices are $0 product invoices with no charge item on
+  them at all; filtering there would empty the view.
 
 Why `generate` runs last in the full lane: it must see all six reads land first, or it bills a
 week whose receipts haven't arrived. It resolves the week from the app's own clock (`today − 7d`
@@ -141,8 +226,13 @@ subsidiary `2` (MacGear AU), Mova class `237` @ location `49` (`AU2 – Melbourn
 warehouse 3PL`), Mova vendor/supplier **`10872`** = "Mova Technologies (AU) **($AUD)**" — note
 `10504` is the **$USD** entity and `10688` is NZ, easy to grab by mistake. Units-per-pallet field
 is `custitem_pallet_quantity` (`custitem_pallet_layer_quantity` is a *different*, per-layer field).
-Mova's **3PL billing customer record is still undecided** — none of the four Mova customers
-(`10501` AU Online, `10502` NZ Online, `10567`/`10859` DOA replacements) is a 3PL billing entity.
+Mova's **3PL billing customer record is `11066` — "Spacewalker Technology Hong Kong Co.,
+Limited"** (customer number `03431`), decided 2026-08-05. Its currency is **AUD**, so the AUD
+rate card invoices at face value; the sync pulls `currency` back on every invoice and the
+billing page warns if a returned invoice isn't AUD, so a future change to that record can't
+silently mis-bill. It is an existing trading entity, hence `invoice_items_only` (see above).
+None of the four Mova customers (`10501` AU Online, `10502` NZ Online, `10567`/`10859` DOA
+replacements) was a 3PL billing entity.
 
 Brand = NetSuite **classification** (store class id, not text). Mova uses its **regular MOVA brand** —
 class `237` (MOVA) @ location `49` (warehouse 3PL); Skriva class `236` @ location `2` (Auckland).

@@ -6,8 +6,8 @@ classification id (ns_class_id), validated 2026-06-26 (see docs/netsuite_validat
 """
 from datetime import date, datetime
 
-from sqlalchemy import (Boolean, Date, DateTime, ForeignKey, Integer, Numeric,
-                        String, Text, UniqueConstraint)
+from sqlalchemy import (Boolean, Date, DateTime, ForeignKey, Index, Integer, Numeric,
+                        String, Text, UniqueConstraint, text)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -15,6 +15,11 @@ from .db import Base
 # Stable charge-type keys the billing engine switches on.
 CHARGE_TYPES = ("container_unload", "putaway", "storage", "picking_so",
                 "picking_vrma", "shipping")
+
+# How a BillingLine came to exist. 'computed' is the rate card's own arithmetic; the other
+# three are human acts on a draft, and each keeps the computed figures alongside so the
+# preview can always show what the rate card said before anyone touched it.
+LINE_ORIGINS = ("computed", "edited", "manual", "removed")
 
 
 # --- config / dimensions -----------------------------------------------------
@@ -35,6 +40,13 @@ class Customer(Base):
     # brand alone would leak non-3PL activity). False: brand class is 3PL-exclusive and stock may
     # span locations, so scope by class only (e.g. Skriva — Auckland + Christchurch). See db.py.
     location_scoped: Mapped[bool] = mapped_column(Boolean, default=False)
+    # True: the NetSuite customer record also carries non-3PL trade, so the invoice read is
+    # narrowed to invoices containing at least one ChargeItem (Mova bills to Spacewalker HK
+    # `11066`, an existing trading entity — without this its product invoices would appear in
+    # the customer-facing Invoices view). False: pull every invoice on the record (Skriva,
+    # whose invoices are $0 product invoices carrying no 3PL charge item at all — filtering
+    # would empty its view).
+    invoice_items_only: Mapped[bool] = mapped_column(Boolean, default=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -50,6 +62,47 @@ class Item(Base):
     sku: Mapped[str] = mapped_column(String)
     description: Mapped[str | None] = mapped_column(String, nullable=True)
     units_per_pallet: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class ChargeItem(Base):
+    """The NetSuite service items a 3PL invoice line can be raised against.
+
+    This is the app's copy of Macgear's `3PL - *` item set. It exists for two reasons:
+
+    1. It replaces the hardcoded `CHARGE_ITEMS` map that used to live in the n8n Code node.
+       n8n now just passes through the `ns_item_id` the app resolved, so moving sandbox ->
+       production is an admin-console edit, not a workflow edit. (The sandbox ids 55070-55074
+       in the old map do not exist in production — that map was a standing cutover trap.)
+    2. A draft line added by hand needs an item id chosen per line. A static map keyed by
+       charge_type cannot supply one, because ad-hoc charges (kitting, freight, additional
+       labour) have no charge_type at all.
+
+    `charge_type` is set only on the items backing an automated charge, and is unique among
+    non-NULL values — that mapping is what the push resolves computed lines through. Items
+    with a NULL charge_type are available to manual lines only.
+
+    Deliberately global rather than per-customer: these are Macgear's own service items, one
+    set per NetSuite account. If an NZ subsidiary ever needs its own item ids, add
+    `ns_subsidiary_id` here and resolve by the customer's subsidiary — don't fork the table.
+    """
+    __tablename__ = "charge_item"
+    # One item per automated charge, enforced in the DB and not only in the admin save
+    # handler — an ambiguous mapping would make charge_item_for() pick arbitrarily, and the
+    # charge it resolves is what lands on a customer's invoice. Partial so the many ad-hoc
+    # items (charge_type NULL) don't collide with each other; both engines support it.
+    __table_args__ = (
+        Index("charge_item_charge_type_uq", "charge_type", unique=True,
+              sqlite_where=text("charge_type IS NOT NULL"),
+              postgresql_where=text("charge_type IS NOT NULL")),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ns_item_id: Mapped[str] = mapped_column(String, unique=True)    # NetSuite internal id
+    name: Mapped[str] = mapped_column(String)                       # e.g. '3PL - Putaway Fee'
+    # NULL = ad-hoc only. Non-NULL = the automated charge this item invoices.
+    charge_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    default_rate: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=100)
 
 
 class RateCard(Base):
@@ -194,6 +247,12 @@ class Invoice(Base):
     trandate: Mapped[date | None] = mapped_column(Date, nullable=True)
     status: Mapped[str | None] = mapped_column(String, nullable=True)
     total: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    # Transaction currency. The push never sets currency — NetSuite sources it from the
+    # customer record — so this is how a mismatch with the (AUD) rate card becomes visible
+    # instead of silently invoicing $1,500 USD per container. Verified AUD on `11066`.
+    currency: Mapped[str | None] = mapped_column(String, nullable=True)
+    amount_remaining: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     ns_lastmodified: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     synced_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     lines: Mapped[list["InvoiceLine"]] = relationship(
@@ -204,6 +263,10 @@ class InvoiceLine(Base):
     __tablename__ = "invoice_line"
     id: Mapped[int] = mapped_column(primary_key=True)
     invoice_id: Mapped[int] = mapped_column(ForeignKey("invoice.id"))
+    # The NetSuite item on the line. Without it a line edited in NetSuite could not be matched
+    # back to the billing line it came from — descriptions are free text and get edited too.
+    # charge_type is resolved from it through ChargeItem at ingest.
+    ns_item_id: Mapped[str | None] = mapped_column(String, nullable=True)
     charge_type: Mapped[str | None] = mapped_column(String, nullable=True)
     description: Mapped[str | None] = mapped_column(String, nullable=True)
     qty: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
@@ -228,6 +291,14 @@ class BillingRun(Base):
     # scheduled auto-generate. NULL = open draft.
     locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     locked_by: Mapped[str | None] = mapped_column(String, nullable=True)  # user email
+    # Set the first time a human edits the draft's lines. Its presence is what blocks a
+    # recompute from silently discarding those edits (see main._recompute_blocked).
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    edited_by: Mapped[str | None] = mapped_column(String, nullable=True)  # user email
+    # Written by the invoice sync when something about the pushed invoice needs a human:
+    # it has vanished from NetSuite, or its total no longer matches what we pushed. Never
+    # acted on automatically — a run's status is not rolled back by a sync.
+    sync_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     lines: Mapped[list["BillingLine"]] = relationship(
         back_populates="run", cascade="all, delete-orphan")
 
@@ -242,7 +313,34 @@ class BillingLine(Base):
     rate: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
     amount: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
     source_refs: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON audit
+    # --- draft editing (2026-08-05) ------------------------------------------------
+    # A draft's lines may now be edited before pushing, which reverses the earlier
+    # "NetSuite-side only" decision. The property that decision protected — that a run is a
+    # faithful record of what the rate card produced — is preserved by keeping the computed
+    # figures HERE rather than overwriting them: qty/rate/amount are what will be invoiced,
+    # computed_qty/computed_amount are what the engine said. A deleted computed line is kept
+    # as origin='removed' with amount 0 rather than actually deleted, because a charge that
+    # silently vanishes is exactly the failure mode this module exists to prevent.
+    origin: Mapped[str] = mapped_column(String, default="computed")   # see LINE_ORIGINS
+    computed_qty: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    computed_rate: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    computed_amount: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    # Resolved at push time: from ChargeItem.charge_type for computed lines, or chosen
+    # directly on a manual line. Nothing is queued for NetSuite until every billable line
+    # has one (main.queue_billing_run).
+    ns_item_id: Mapped[str | None] = mapped_column(String, nullable=True)
     run: Mapped["BillingRun"] = relationship(back_populates="lines")
+
+    @property
+    def billable(self) -> bool:
+        return self.origin != "removed"
+
+    @property
+    def variance(self) -> float | None:
+        """Edited amount minus what the rate card computed. None when nothing to compare."""
+        if self.computed_amount is None or self.amount is None:
+            return None
+        return round(float(self.amount) - float(self.computed_amount), 2)
 
 
 class User(Base):

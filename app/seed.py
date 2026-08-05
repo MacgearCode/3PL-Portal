@@ -16,6 +16,7 @@ from datetime import date, timedelta
 
 from sqlalchemy import select
 
+from . import service
 from .db import Base, SessionLocal, engine, ensure_columns
 from .models import (BillingLine, BillingRun, Customer, InboundShipment, Item,
                      ItemFulfilment, ItemFulfilmentLine, ItemReceipt, ItemReceiptLine,
@@ -211,6 +212,13 @@ def seed():
     ensure_columns()   # add columns to a pre-existing db before we query them
     db = SessionLocal()
     try:
+        # The NetSuite charge-item catalogue. Must run BEFORE the early return below: an
+        # existing deploy already has customers, and its `charge_item` table is brand new and
+        # empty. Idempotent — a no-op once the table holds anything, so an id corrected in the
+        # admin console is never reverted by a redeploy.
+        n = service.bootstrap_charge_items(db)
+        if n:
+            print(f"Seeded {n} NetSuite charge items.")
         if db.query(Customer).count() > 0:
             print("Customers already present — skipping customer/demo seed.")
             seed_users(db)

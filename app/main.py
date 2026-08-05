@@ -22,13 +22,18 @@ from sqlalchemy.orm import Session
 from . import netsuite, perms, service
 from .billing import compute_billing, result_to_run_kwargs
 from .db import Base, SessionLocal, engine, ensure_columns, get_db
-from .models import (BillingLine, BillingRun, Customer, Invoice, RateCard, RateCardLine, User)
+from .models import (CHARGE_TYPES, BillingLine, BillingRun, ChargeItem, Customer, Invoice,
+                     RateCard, RateCardLine, User)
 from .notify import send_reset_email
 from .security import hash_password, hash_token, make_reset_token, sign, unsign, verify_password
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 Base.metadata.create_all(engine)
 ensure_columns()
+# Populate the NetSuite charge-item catalogue on a fresh db. No-op once it holds anything,
+# so an id corrected in the admin console is never reverted by a restart.
+with SessionLocal() as _s:
+    service.bootstrap_charge_items(_s)
 
 app = FastAPI(title="Macgear 3PL Portal")
 app.mount("/static", StaticFiles(directory=os.path.join(HERE, "static")), name="static")
@@ -521,7 +526,24 @@ def portal(slug: str, view: str, request: Request, db: Session = Depends(get_db)
         # a run already queued/pushed, or an explicitly closed period, blocks re-billing
         same = next((r for r in runs if r.period_start == ps_d and r.period_end == pe_d), None)
         ctx["block_reason"] = _recompute_blocked(same)
-        ctx["locked_run"] = same if ctx["block_reason"] else None
+        # 'has-edits' is not a lock — the draft is still editable and pushable, it just can't
+        # be silently recomputed. Only the two real freezes make the preview read-only.
+        ctx["locked_run"] = same if ctx["block_reason"] in (
+            "already-invoiced", "already-locked") else None
+        # Once a run exists for the period IT is what the page is about, not the live preview:
+        # the preview is what the rate card says right now, the run is what was (or will be)
+        # invoiced, and after a push those two routinely differ. Showing a recomputed preview
+        # above a variance table was actively misleading on the one screen people reconcile
+        # invoices against. `period_run` renders the run's own lines; `draft_run` additionally
+        # says they may be edited.
+        ctx["period_run"] = same
+        ctx["draft_run"] = same if (same and same.status == "draft" and not same.locked_at) else None
+        ctx["charge_items"] = service.charge_items(db)
+        # Variance against the NetSuite invoice, for whichever run is on screen or the most
+        # recent pushed one — this is where an edit made in NetSuite after the push shows up.
+        target = same or next((r for r in runs if r.ns_invoice_id), None)
+        ctx["variance"] = service.run_variance(db, target) if target else None
+        ctx["variance_run"] = target if ctx["variance"] else None
     return templates.TemplateResponse(request, "portal.html", ctx)
 
 
@@ -552,12 +574,15 @@ def _existing_run(db: Session, customer_id: int, ps: date, pe: date) -> BillingR
         BillingRun.period_end == pe))
 
 
-def _recompute_blocked(run: BillingRun | None) -> str | None:
+def _recompute_blocked(run: BillingRun | None, allow_discard: bool = False) -> str | None:
     """Why this period's lines may not be (re)computed — a `msg=` code, or None if it's free.
 
-    Two independent guards: the run has left the portal for NetSuite, or the period has been
-    explicitly closed. Both must hold for the manual save AND the scheduled auto-generate, so
-    the reason lives here rather than in either caller.
+    Three independent guards: the run has left the portal for NetSuite, the period has been
+    explicitly closed, or a human has hand-edited the draft. All must hold for the manual
+    save AND the scheduled auto-generate, so the reason lives here rather than in either
+    caller. `allow_discard` lifts only the edit guard — the operator has confirmed on the
+    form that recomputing throws their manual lines away; it never unlocks a closed or
+    pushed period.
     """
     if run is None:
         return None
@@ -565,26 +590,60 @@ def _recompute_blocked(run: BillingRun | None) -> str | None:
         return "already-invoiced"
     if run.locked_at:
         return "already-locked"
+    if run.edited_at and not allow_discard:
+        return "has-edits"
     return None
 
 
 def _persist_billing_run(db: Session, cust: Customer, ps: date, pe: date, res) -> BillingRun:
     """Write a computed result to a draft run, replacing any existing lines for the period.
 
-    Callers MUST have checked `_recompute_blocked()` first — this only writes.
+    Callers MUST have checked `_recompute_blocked()` first — this only writes. Manual and
+    edited lines go with everything else: a recompute is a clean rebuild from the rate card,
+    which is exactly why `_recompute_blocked` refuses to reach here on an edited run unless
+    the operator explicitly confirmed the discard.
     """
     run = _existing_run(db, cust.id, ps, pe)
     if run:
         for l in list(run.lines):
             db.delete(l)
+        run.edited_at = run.edited_by = None
     else:
         run = BillingRun(customer_id=cust.id, period_start=ps, period_end=pe)
         db.add(run)
         db.flush()
-    for kw in result_to_run_kwargs(res):
+    item_by_charge = {ct: ci.ns_item_id for ct in CHARGE_TYPES
+                      if (ci := service.charge_item_for(db, ct))}
+    for kw in result_to_run_kwargs(res, item_by_charge):
         db.add(BillingLine(billing_run_id=run.id, **kw))
     run.status = "draft"
     return run
+
+
+def _editable_run(db: Session, slug: str, run_id: int, request: Request):
+    """(run, customer) for a draft a Macgear user may edit, or (None, None).
+
+    Editing is refused on anything that has left the portal or been closed — the whole point
+    of "Close period" is that what you reviewed is what gets pushed.
+    """
+    user = cur(request)
+    run = db.get(BillingRun, run_id)
+    cust = _get_customer(db, slug)
+    if not cust or not run or run.customer_id != cust.id or not perms.is_internal(user):
+        return None, None
+    if run.status != "draft" or run.locked_at:
+        return None, None
+    return run, cust
+
+
+def _mark_edited(run: BillingRun, request: Request):
+    user = cur(request)
+    run.edited_at = datetime.utcnow()
+    run.edited_by = user.email if user else None
+
+
+def _amount(qty, rate) -> float:
+    return round(float(qty) * float(rate), 2)
 
 
 @app.post("/c/{slug}/billing/run")
@@ -604,13 +663,146 @@ async def create_billing_run(slug: str, request: Request, db: Session = Depends(
     # range whose storage would be mis-prorated and whose run could overlap another.
     if ps.weekday() != 0 or pe != ps + timedelta(days=6):
         return RedirectResponse(f"/c/{slug}/billing?msg=bad-period", status_code=303)
-    blocked = _recompute_blocked(_existing_run(db, cust.id, ps, pe))
+    # "Recompute" on an already-edited draft ticks this, having been warned that the manual
+    # lines go. Nothing else can lift the edit guard.
+    discard = form.get("discard_edits") is not None
+    blocked = _recompute_blocked(_existing_run(db, cust.id, ps, pe), allow_discard=discard)
     if blocked:
         return RedirectResponse(
             f"/c/{slug}/billing?from={ps}&to={pe}&msg={blocked}", status_code=303)
     _persist_billing_run(db, cust, ps, pe, compute_billing(db, cust, ps, pe))
     db.commit()
-    return RedirectResponse(f"/c/{slug}/billing?from={ps}&to={pe}&msg=saved", status_code=303)
+    msg = "recomputed" if discard else "saved"
+    return RedirectResponse(f"/c/{slug}/billing?from={ps}&to={pe}&msg={msg}", status_code=303)
+
+
+# --- draft editing ------------------------------------------------------------
+# Reverses the earlier "edit in NetSuite only" decision (CLAUDE.md). The rule it protected
+# still holds and is enforced structurally, not by convention: a computed line's own
+# arithmetic is never overwritten. qty/rate/amount become what will be invoiced;
+# computed_qty/computed_amount keep what the rate card produced, so every draft can show
+# what was changed and by how much, and "why is this invoice not 22 x $1,500?" stays
+# answerable months later.
+@app.post("/c/{slug}/billing/line/{run_id}")
+async def edit_billing_line(slug: str, run_id: int, request: Request,
+                            db: Session = Depends(get_db)):
+    """Update one line's qty / rate / description on a draft run."""
+    run, cust = _editable_run(db, slug, run_id, request)
+    if not run:
+        return RedirectResponse(f"/c/{slug}/billing?msg=not-editable", status_code=303)
+    form = await request.form()
+    line = db.get(BillingLine, int(form.get("line_id") or 0))
+    qs = f"from={run.period_start}&to={run.period_end}"
+    if not line or line.billing_run_id != run.id:
+        return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=bad-line", status_code=303)
+    try:
+        qty = round(float(form.get("qty")), 2)
+        rate = round(float(form.get("rate")), 2)
+    except (TypeError, ValueError):
+        return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=bad-line", status_code=303)
+    if qty < 0 or rate < 0:
+        return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=bad-line", status_code=303)
+    desc = (form.get("description") or "").strip()
+    line.qty, line.rate, line.amount = qty, rate, _amount(qty, rate)
+    if desc:
+        line.description = desc
+    # A computed line that's been touched becomes 'edited' and keeps its computed_* values.
+    # A manual line stays manual — there is nothing to vary from. `origin is None` covers rows
+    # saved before draft editing existed: they are computed lines, just from before the column.
+    if line.origin in ("computed", "removed", None):
+        line.origin = "edited"
+    _mark_edited(run, request)
+    db.commit()
+    return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=line-saved", status_code=303)
+
+
+@app.post("/c/{slug}/billing/line/{run_id}/add")
+async def add_billing_line(slug: str, run_id: int, request: Request,
+                           db: Session = Depends(get_db)):
+    """Add an ad-hoc charge line to a draft run, off the NetSuite charge-item catalogue.
+
+    This is the flexibility the first fortnight of live 3PL work turned out to need: the rate
+    card automates five charges, but the account carries ten items (kitting, packaging,
+    freight, additional labour, system fee) that come up case by case. They are deliberately
+    NOT wired into the billing engine — nothing derives them from cached NetSuite data, so
+    there is nothing to automate. They are entered by a human, per week, against the item
+    they will invoice against.
+    """
+    run, cust = _editable_run(db, slug, run_id, request)
+    if not run:
+        return RedirectResponse(f"/c/{slug}/billing?msg=not-editable", status_code=303)
+    form = await request.form()
+    qs = f"from={run.period_start}&to={run.period_end}"
+    item = db.scalar(select(ChargeItem).where(
+        ChargeItem.ns_item_id == (form.get("ns_item_id") or "").strip()))
+    try:
+        qty = round(float(form.get("qty")), 2)
+        rate = round(float(form.get("rate")), 2)
+    except (TypeError, ValueError):
+        return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=bad-line", status_code=303)
+    if not item or qty <= 0 or rate < 0:
+        return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=bad-line", status_code=303)
+    desc = (form.get("description") or "").strip() or item.name
+    db.add(BillingLine(
+        billing_run_id=run.id,
+        # Manual lines carry the item's charge_type when it has one (so a hand-added storage
+        # correction still groups with storage in the variance), else a stable `adhoc:<id>`
+        # key — never NULL, because charge_type is the run's own line identity.
+        charge_type=item.charge_type or f"adhoc:{item.ns_item_id}",
+        description=desc, qty=qty, rate=rate, amount=_amount(qty, rate),
+        source_refs=json.dumps([f"added manually by {(cur(request) or User()).email or '?'}"]),
+        origin="manual", ns_item_id=item.ns_item_id))
+    _mark_edited(run, request)
+    db.commit()
+    return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=line-added", status_code=303)
+
+
+@app.post("/c/{slug}/billing/line/{run_id}/remove")
+async def remove_billing_line(slug: str, run_id: int, request: Request,
+                              db: Session = Depends(get_db)):
+    """Drop a line from a draft run.
+
+    A manual line is deleted outright. A COMPUTED line is not — it's kept at origin='removed'
+    with amount 0, still visible on the draft with its computed figure alongside. A charge
+    the engine raised and a human then dropped is exactly the kind of thing that must leave a
+    trace: silently vanishing charges are what put 9 containers ($13,500) off an invoice for
+    a fortnight without anyone noticing.
+    """
+    run, cust = _editable_run(db, slug, run_id, request)
+    if not run:
+        return RedirectResponse(f"/c/{slug}/billing?msg=not-editable", status_code=303)
+    form = await request.form()
+    line = db.get(BillingLine, int(form.get("line_id") or 0))
+    qs = f"from={run.period_start}&to={run.period_end}"
+    if not line or line.billing_run_id != run.id:
+        return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=bad-line", status_code=303)
+    if line.origin == "manual":
+        db.delete(line)
+    else:
+        line.origin, line.qty, line.amount = "removed", 0, 0
+    _mark_edited(run, request)
+    db.commit()
+    return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=line-removed", status_code=303)
+
+
+@app.post("/c/{slug}/billing/line/{run_id}/restore")
+async def restore_billing_line(slug: str, run_id: int, request: Request,
+                               db: Session = Depends(get_db)):
+    """Put a removed computed line back at its rate-card figures."""
+    run, cust = _editable_run(db, slug, run_id, request)
+    if not run:
+        return RedirectResponse(f"/c/{slug}/billing?msg=not-editable", status_code=303)
+    form = await request.form()
+    line = db.get(BillingLine, int(form.get("line_id") or 0))
+    qs = f"from={run.period_start}&to={run.period_end}"
+    if not line or line.billing_run_id != run.id or line.computed_amount is None:
+        return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=bad-line", status_code=303)
+    line.qty, line.rate = line.computed_qty, line.computed_rate
+    line.amount = line.computed_amount
+    line.origin = "computed"
+    _mark_edited(run, request)
+    db.commit()
+    return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=line-restored", status_code=303)
 
 
 @app.post("/c/{slug}/billing/lock/{run_id}")
@@ -648,9 +840,39 @@ def queue_billing_run(slug: str, run_id: int, request: Request, db: Session = De
     qs = f"from={run.period_start}&to={run.period_end}"
     if run.status in ("ready_to_push", "pushed", "invoiced"):
         return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=already-queued", status_code=303)
+    # Every billable line must resolve to a NetSuite item BEFORE it leaves the portal. The
+    # push used to fail inside n8n (undefined item id -> a NetSuite error in a log nobody
+    # reads overnight, run stuck at ready_to_push); refusing here puts the failure in front
+    # of the person who pressed the button, with the charge named.
+    if (missing := _unmapped_lines(db, run)):
+        return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=no-item&ct={missing[0]}",
+                                status_code=303)
+    if not cust.ns_customer_id:
+        return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=no-bill-to", status_code=303)
     run.status = "ready_to_push"
     db.commit()
     return RedirectResponse(f"/c/{slug}/billing?{qs}&msg=queued", status_code=303)
+
+
+def _unmapped_lines(db: Session, run: BillingRun) -> list[str]:
+    """Charge types on this run whose line has no NetSuite item to invoice against.
+
+    Lines are stamped with an item at save time, but a run saved before the catalogue was
+    filled in (or against a charge type nobody mapped) carries NULL — so fall back to the
+    catalogue here before declaring it unmappable, which lets an older draft be fixed by
+    mapping the item rather than by re-billing the week.
+    """
+    missing = []
+    for l in run.lines:
+        if not l.billable:
+            continue
+        if not l.ns_item_id:
+            item = service.charge_item_for(db, l.charge_type)
+            if item is None:
+                missing.append(l.charge_type)
+            else:
+                l.ns_item_id = item.ns_item_id     # heal it in place
+    return missing
 
 
 # --- admin console (admin role only) -----------------------------------------
@@ -766,6 +988,56 @@ def admin_customers(request: Request, db: Session = Depends(get_db)):
                                       {"section": "customers", "customers": _customers(db)})
 
 
+@app.get("/admin/charge-items", response_class=HTMLResponse)
+def admin_charge_items(request: Request, db: Session = Depends(get_db)):
+    """The NetSuite service items 3PL invoice lines are raised against.
+
+    Replaces the CHARGE_ITEMS constant that used to live in the n8n Code node, where the ids
+    were sandbox-only and going to production meant editing a workflow. Two jobs: map the
+    five automated charges to their items, and expose the rest of the `3PL - *` set for
+    ad-hoc lines on a draft.
+    """
+    if (r := _deny_non_admin(request)):
+        return r
+    return templates.TemplateResponse(request, "admin_charge_items.html", {
+        "section": "charge_items", "items": service.charge_items(db, active_only=False),
+        "charge_types": CHARGE_TYPES, "aliases": service.CHARGE_TYPE_ALIASES,
+        "unmapped": service.unmapped_charge_types(db),
+        "saved": request.query_params.get("saved"), "error": ""})
+
+
+@app.post("/admin/charge-items")
+async def admin_charge_items_save(request: Request, db: Session = Depends(get_db)):
+    if (r := _deny_non_admin(request)):
+        return r
+    form = await request.form()
+    # Existing rows: charge_type / active / sort. charge_type is one-item-per-charge, so
+    # assigning it to a second item clears it from the first rather than silently creating
+    # an ambiguous mapping that charge_item_for() would resolve arbitrarily.
+    for item in service.charge_items(db, active_only=False):
+        ct = (form.get(f"ct_{item.id}") or "").strip() or None
+        if ct and ct not in CHARGE_TYPES:
+            ct = None
+        if ct and ct != item.charge_type:
+            for other in db.scalars(select(ChargeItem).where(
+                    ChargeItem.charge_type == ct, ChargeItem.id != item.id)).all():
+                other.charge_type = None
+        item.charge_type = ct
+        item.active = form.get(f"active_{item.id}") is not None
+        try:
+            item.sort_order = int(form.get(f"sort_{item.id}") or item.sort_order)
+        except ValueError:
+            pass
+    # Optional new row.
+    ns_id = (form.get("new_ns_item_id") or "").strip()
+    name = (form.get("new_name") or "").strip()
+    if ns_id and name and not db.scalar(
+            select(ChargeItem).where(ChargeItem.ns_item_id == ns_id)):
+        db.add(ChargeItem(ns_item_id=ns_id, name=name, sort_order=200))
+    db.commit()
+    return RedirectResponse("/admin/charge-items?saved=1", status_code=303)
+
+
 def _safe_rate(raw) -> float:
     try:
         return round(float(raw), 2)
@@ -796,6 +1068,7 @@ async def admin_customer_create(request: Request, db: Session = Depends(get_db))
     name = (form.get("name", "") or "").strip()
     ns_customer_id = (form.get("ns_customer_id", "") or "").strip()
     location_scoped = form.get("location_scoped") is not None  # checkbox: present only when ticked
+    invoice_items_only = form.get("invoice_items_only") is not None
 
     error = ""
     if not slug or not all(ch.isalnum() or ch == "-" for ch in slug):
@@ -815,6 +1088,7 @@ async def admin_customer_create(request: Request, db: Session = Depends(get_db))
                      ns_subsidiary_id=form.get("ns_subsidiary_id", "").strip() or None,
                      brand_label=form.get("brand_label", "").strip() or None,
                      location_scoped=location_scoped,
+                     invoice_items_only=invoice_items_only,
                      location_label=form.get("location_label", "").strip() or None)
         charges = [{**ch, "rate": _safe_rate(form.get(f"rate_{ch['charge_type']}"))}
                    for ch in _blank_charges()]
@@ -829,6 +1103,7 @@ async def admin_customer_create(request: Request, db: Session = Depends(get_db))
                  ns_subsidiary_id=form.get("ns_subsidiary_id", "").strip() or None,
                  brand_label=form.get("brand_label", "").strip() or None,
                  location_scoped=location_scoped,
+                 invoice_items_only=invoice_items_only,
                  location_label=form.get("location_label", "").strip() or None)
     db.add(c)
     db.flush()
@@ -878,6 +1153,7 @@ async def admin_customer_save(cust_id: int, request: Request, db: Session = Depe
     c.ns_class_id = form.get("ns_class_id", "").strip() or None
     c.ns_subsidiary_id = form.get("ns_subsidiary_id", "").strip() or None
     c.location_scoped = form.get("location_scoped") is not None  # checkbox: present only when ticked
+    c.invoice_items_only = form.get("invoice_items_only") is not None
 
     # Rate-card edit: if any rate changed, create a NEW effective-dated card (today)
     # and close the previous one — so historical billing runs still reprice correctly.
@@ -931,10 +1207,17 @@ def admin_sync_config(request: Request, db: Session = Depends(get_db)):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     custs = db.scalars(select(Customer).where(Customer.active == True)  # noqa: E712
                        .order_by(Customer.slug)).all()
-    return JSONResponse({"customers": [
+    # charge_item_ids rides along so the RESTlet can narrow the invoice read to invoices
+    # carrying a 3PL charge item — needed because Mova bills to Spacewalker HK (11066), an
+    # existing trading entity whose other invoices must not appear in the customer portal.
+    # Applied per customer via invoice_items_only, so Skriva (whose invoices are $0 product
+    # invoices with no charge item on them) still sees all of its own.
+    item_ids = [ci.ns_item_id for ci in service.charge_items(db)]
+    return JSONResponse({"charge_item_ids": item_ids, "customers": [
         {"slug": c.slug, "ns_customer_id": c.ns_customer_id, "ns_supplier_id": c.ns_supplier_id,
          "ns_location_id": c.ns_location_id, "ns_class_id": c.ns_class_id,
-         "ns_subsidiary_id": c.ns_subsidiary_id, "location_scoped": bool(c.location_scoped)}
+         "ns_subsidiary_id": c.ns_subsidiary_id, "location_scoped": bool(c.location_scoped),
+         "invoice_items_only": bool(c.invoice_items_only)}
         for c in custs if c.ns_class_id]})
 
 
@@ -969,13 +1252,20 @@ def admin_billing_pending(request: Request, db: Session = Depends(get_db)):
     out = []
     for r in runs:
         c = db.get(Customer, r.customer_id)
+        # ns_item_id per line, resolved app-side. This is what retired the CHARGE_ITEMS map
+        # hardcoded in the n8n Code node: n8n no longer knows anything about which item backs
+        # which charge, so moving sandbox -> production (or adding an ad-hoc charge) is an
+        # admin-console edit rather than a workflow edit. Removed lines are omitted entirely.
+        lines = [{"charge_type": l.charge_type, "ns_item_id": l.ns_item_id,
+                  "description": l.description, "qty": float(l.qty or 0),
+                  "rate": float(l.rate or 0), "amount": float(l.amount or 0),
+                  "origin": l.origin or "computed"}
+                 for l in r.lines if l.billable]
         out.append({
             "run_id": r.id, "customer": c.slug, "ns_customer_id": c.ns_customer_id,
             "ns_subsidiary_id": c.ns_subsidiary_id, "ns_location_id": c.ns_location_id,
             "period_start": r.period_start.isoformat(), "period_end": r.period_end.isoformat(),
-            "lines": [{"charge_type": l.charge_type, "description": l.description,
-                       "qty": float(l.qty or 0), "rate": float(l.rate or 0),
-                       "amount": float(l.amount or 0)} for l in r.lines]})
+            "total": round(sum(l["amount"] for l in lines), 2), "lines": lines})
     return JSONResponse({"pending": out})
 
 

@@ -320,17 +320,28 @@
     {% elif view == "billing" %}
       <div class="flowline">Automated weekly run · <code>SuiteQL</code> → <code>rate card</code> → <code>draft invoice</code> on the {{ customer.name }} customer record · replaces 5 manual saved searches</div>
       {% set flash = {'saved':['ok','Billing run saved as draft.'],
+                      'recomputed':['ok','Draft recomputed from the rate card — manual edits and added lines were discarded.'],
                       'queued':['ok','Queued for NetSuite — n8n creates the draft invoice on its next run; it appears under Invoices after the following sync.'],
                       'locked':['ok','Period closed. The lines are frozen — it can still be pushed, but not recomputed.'],
+                      'line-saved':['ok','Line updated. The rate-card figure is kept alongside it.'],
+                      'line-added':['ok','Charge added to the draft.'],
+                      'line-removed':['ok','Line removed. A computed line stays listed, at $0, so the drop is on the record.'],
+                      'line-restored':['ok','Line restored to its rate-card figures.'],
                       'already-queued':['warn','This run is already queued or pushed.'],
                       'already-locked':['warn','This period is closed — its lines are frozen and cannot be recomputed.'],
+                      'has-edits':['warn','This draft has been edited by hand. Recomputing it from the rate card would discard those changes — use "Recompute, discarding edits" on the draft if that is what you want.'],
+                      'not-editable':['warn','That run is not an editable draft — it has been closed, queued or pushed.'],
+                      'bad-line':['warn','Could not save that line. Quantity and rate must be numbers, and an added line needs a charge item.'],
+                      'no-item':['crit','No NetSuite item is mapped for ' ~ (request.query_params.get('ct') or 'one of the charges') ~ '. Map it in Settings → Charge items, then queue again.'],
+                      'no-bill-to':['crit','This customer has no NetSuite customer id set — nothing to invoice against. Set it in Settings → Customers.'],
                       'bad-period':['warn','Billing periods must be a whole Monday–Sunday week.'],
                       'already-invoiced':['warn','This period is already queued/invoiced — re-billing is blocked.']}.get(msg) %}
       {% if flash %}<div class="flash {{ flash[0] }}">{{ flash[1] }}</div>{% endif %}
       {% if locked_run %}<div class="flash warn">{% if block_reason == 'already-locked' %}This
         period was closed{% if locked_run.locked_by %} by {{ locked_run.locked_by }}{% endif %} (run
         #{{ locked_run.id }}) — the lines below are frozen.{% else %}This period was already pushed to
-        NetSuite (run #{{ locked_run.id }}) — preview is read-only to prevent double-billing.{% endif %}</div>{% endif %}
+        NetSuite (run #{{ locked_run.id }}) — the lines below are read-only to prevent
+        double-billing.{% endif %}</div>{% endif %}
       {# Under-billing risks from the charge engine — a charge computing to zero must never be
          invisible. This is how 9 containers went missing for a fortnight. #}
       {% if result.warnings %}<div class="flash warn"><b>Check these before pushing</b>
@@ -346,6 +357,110 @@
            title="Next week">→</a>
         <span class="sub2">{{ period_label }}</span>
       </form>
+      {# Two states for this grid.
+         NO SAVED RUN -> the live preview: what the rate card says for this week, read-only.
+         SAVED RUN    -> that run's own lines. Editable while it's an open draft; read-only
+                         once closed or pushed, but still the run's figures rather than a
+                         fresh preview — after a push those two routinely differ, and showing
+                         a recomputed preview above the variance table was misleading on the
+                         one screen people reconcile invoices against. #}
+      {% if period_run %}
+      {% set billable = period_run.lines|selectattr('billable')|list %}
+      {% set draft_total = billable|sum(attribute='amount') %}
+      <div class="billgrid">
+        <div class="card"><div class="tablewrap"><table class="edittable">
+          <thead><tr><th>Charge</th><th class="r">Qty</th><th class="r">Rate</th>
+            <th class="r">Amount</th><th class="r">Rate card</th><th></th></tr></thead>
+          <tbody>{% for l in period_run.lines %}
+          <tr class="{{ 'ln-removed' if not l.billable }}">
+            <td class="prim">{{ l.description or l.charge_type }}
+              {% if l.origin == 'manual' %}<span class="chip c-info">added</span>
+              {% elif l.origin == 'edited' %}<span class="chip c-warn">edited</span>
+              {% elif l.origin == 'removed' %}<span class="chip c-neutral">removed</span>{% endif %}</td>
+            {% if not l.billable %}
+            <td class="r num">—</td><td class="r num">—</td><td class="r num">$0.00</td>
+            {% elif draft_run %}
+            <td colspan="3" class="r">
+              <form class="lineform" method="post" action="/c/{{ customer.slug }}/billing/line/{{ draft_run.id }}">
+                <input type="hidden" name="line_id" value="{{ l.id }}">
+                <input class="rateinput" type="number" step="0.01" min="0" name="qty" value="{{ '%.2f'|format(l.qty|float) }}" aria-label="Quantity">
+                <span class="sub2">×</span>
+                <input class="rateinput" type="number" step="0.01" min="0" name="rate" value="{{ '%.2f'|format(l.rate|float) }}" aria-label="Rate">
+                <b class="num">${{ l.amount|money }}</b>
+                <button class="btn mini" type="submit">Save</button>
+              </form>
+            </td>
+            {% else %}
+            <td class="r num">{{ l.qty|qty }}</td><td class="r num">${{ l.rate|money }}</td>
+            <td class="r num"><b>${{ l.amount|money }}</b></td>
+            {% endif %}
+            <td class="r num sub2">{% if l.computed_amount is not none %}${{ l.computed_amount|money }}
+              {% if l.variance %}<span class="chip {{ 'c-crit' if l.variance < 0 else 'c-info' }}">{{ '%+.2f'|format(l.variance) }}</span>{% endif %}
+              {% else %}—{% endif %}</td>
+            <td class="r">
+              {% if draft_run and not l.billable and l.computed_amount is not none %}
+              <form method="post" action="/c/{{ customer.slug }}/billing/line/{{ draft_run.id }}/restore">
+                <input type="hidden" name="line_id" value="{{ l.id }}">
+                <button class="btn mini" type="submit" title="Put this line back at its rate-card figures">Restore</button></form>
+              {% elif draft_run and l.billable %}
+              <form method="post" action="/c/{{ customer.slug }}/billing/line/{{ draft_run.id }}/remove">
+                <input type="hidden" name="line_id" value="{{ l.id }}">
+                <button class="btn mini" type="submit" title="Remove this line from the invoice">Remove</button></form>
+              {% endif %}
+            </td></tr>
+          {% else %}<tr><td class="empty" colspan="6">This run has no lines.</td></tr>{% endfor %}</tbody>
+          <tfoot><tr><td colspan="3">Invoice total (ex GST)</td><td class="r">${{ draft_total|money }}</td>
+            {# Only computed lines have a rate-card figure — a manual line has nothing to sum,
+               so filter before summing or Decimal + None blows up the page. Removed lines ARE
+               included: this column is "what the rate card said", including what was dropped. #}
+            <td class="r sub2">${{ (period_run.lines|selectattr('computed_amount')|sum(attribute='computed_amount'))|money }}</td><td></td></tr></tfoot>
+        </table></div>
+        {# Ad-hoc charges. The rate card automates five; the account carries ten. The other
+           five (kitting, packaging, freight, system fee, additional labour) are not derivable
+           from any cached NetSuite data, so they are entered per week by a human rather than
+           bolted into the billing engine. #}
+        {% if draft_run %}
+        <div class="addline">
+          <form class="frow" method="post" action="/c/{{ customer.slug }}/billing/line/{{ draft_run.id }}/add">
+            <label>Add charge
+              <select name="ns_item_id" required>
+                <option value="">— choose an item —</option>
+                {% for ci in charge_items %}<option value="{{ ci.ns_item_id }}">{{ ci.name }}</option>{% endfor %}
+              </select></label>
+            <label>Description <input name="description" placeholder="optional — defaults to the item name"></label>
+            <label>Qty <input class="rateinput" type="number" step="0.01" min="0" name="qty" value="1"></label>
+            <label>Rate <input class="rateinput" type="number" step="0.01" min="0" name="rate" value="0.00"></label>
+            <button class="btn" type="submit">Add line</button>
+          </form>
+        </div>
+        {% endif %}</div>
+        <div class="summary">
+          <header><div class="lab">{{ 'Draft run' if draft_run else 'Run' }} #{{ period_run.id }} · {{ period_start }} → {{ period_end }}</div>
+            <div class="tot num">${{ draft_total|money }}</div><div class="for">{{ customer.name }} customer record</div></header>
+          <div class="lines">{% for l in billable %}<div class="sl"><span>{{ l.description or l.charge_type }}</span><b class="num">${{ l.amount|money }}</b></div>{% endfor %}</div>
+          <div class="act">
+            {% if period_run.edited_at %}
+            <div class="note">Edited by {{ period_run.edited_by or 'someone' }} — the rate-card
+              figures are kept in the "Rate card" column so the change stays auditable.</div>
+            {% endif %}
+            {% if draft_run %}
+            <form method="post" action="/c/{{ customer.slug }}/billing/run"
+                  onsubmit="return {{ 'confirm(\'Recompute from the rate card? Added lines and edits on this draft will be discarded.\')' if draft_run.edited_at else 'true' }}">
+              <input type="hidden" name="period_start" value="{{ period_start }}">
+              <input type="hidden" name="period_end" value="{{ period_end }}">
+              {% if draft_run.edited_at %}<input type="hidden" name="discard_edits" value="1">{% endif %}
+              <button class="btn" type="submit">{% if draft_run.edited_at %}Recompute, discarding edits{% else %}Recompute from rate card{% endif %}</button>
+            </form>
+            <span class="note">Close the period to freeze these lines, then queue it below.</span>
+            {% else %}
+            <span class="note">These are the run's own figures, not a fresh preview — the rate
+              card may have changed since. {% if period_run.status != 'draft' %}This period has
+              left the portal, so the lines are read-only.{% else %}This period is closed.{% endif %}</span>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+      {% else %}
       <div class="billgrid">
         <div class="card"><div class="tablewrap"><table>
           <thead><tr><th>Charge</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead>
@@ -365,10 +480,49 @@
               <input type="hidden" name="period_end" value="{{ period_end }}">
               <button class="btn primary" type="submit" {{ 'disabled' if not result.lines or locked_run }}>Save draft billing run</button>
             </form>
-            <span class="note">Save the draft, then push it to NetSuite from the run below.</span>
+            <span class="note">Save the draft, then edit, close and push it from the run below.</span>
           </div>
         </div>
       </div>
+      {% endif %}
+
+      {# What NetSuite actually holds, against what the portal pushed. Anyone may edit the
+         invoice in NetSuite after it's created; the sync pulls those edits back, and this is
+         where they become visible. The run's own lines are never overwritten by them. #}
+      {% if variance %}
+      <h2>NetSuite invoice {{ variance.invoice.tranid or variance.invoice.ns_invoice_id }}</h2>
+      <div class="flash {{ 'warn' if variance.differs else 'ok' }}">
+        {% if variance.differs %}<b>This invoice differs from what the portal pushed.</b>
+        NetSuite is the source of truth for what was billed — the run below is kept as the record
+        of what the rate card produced.
+        {% else %}This invoice matches the billing run line for line.{% endif %}
+        {% if variance.invoice.currency and variance.invoice.currency|upper not in ('AUD','AU$','AUSTRALIAN DOLLAR') %}
+        <br><b>Currency is {{ variance.invoice.currency }}</b>, but the rate card is priced in AUD — check this before treating the total as correct.
+        {% endif %}
+      </div>
+      <div class="card"><div class="tablewrap"><table>
+        <thead><tr><th>Charge</th><th class="r">Portal qty</th><th class="r">Portal</th>
+          <th class="r">NetSuite qty</th><th class="r">NetSuite</th><th class="r">Difference</th></tr></thead>
+        <tbody>{% for r in variance.rows %}<tr>
+          <td class="prim">{{ r.label }}
+            {% if r.state == 'added' %}<span class="chip c-info">added in NetSuite</span>
+            {% elif r.state == 'removed' %}<span class="chip c-crit">not on the invoice</span>
+            {% elif r.state == 'changed' %}<span class="chip c-warn">changed</span>{% endif %}</td>
+          <td class="r num">{{ r.run_qty|qty if r.run_qty is not none else '—' }}</td>
+          <td class="r num">{{ '$' ~ r.run_amount|money if r.run_amount is not none else '—' }}</td>
+          <td class="r num">{{ r.ns_qty|qty if r.ns_qty is not none else '—' }}</td>
+          <td class="r num">{{ '$' ~ r.ns_amount|money if r.ns_amount is not none else '—' }}</td>
+          <td class="r num">{% if r.delta %}<b class="{{ 'neg' if r.delta < 0 }}">{{ '%+.2f'|format(r.delta) }}</b>{% else %}—{% endif %}</td>
+        </tr>{% endfor %}</tbody>
+        <tfoot><tr><td colspan="2">Total</td><td class="r">${{ variance.run_total|money }}</td><td></td>
+          <td class="r">{{ '$' ~ variance.ns_total|money if variance.ns_total is not none else '—' }}</td>
+          <td class="r">{% if variance.delta %}{{ '%+.2f'|format(variance.delta) }}{% else %}—{% endif %}</td></tr></tfoot>
+      </table></div></div>
+      <p class="note">Status <b>{{ variance.invoice.status or '—' }}</b>{% if variance.invoice.amount_remaining is not none %} ·
+        outstanding <b>${{ variance.invoice.amount_remaining|money }}</b>{% endif %}{% if variance.invoice.due_date %} ·
+        due {{ variance.invoice.due_date|d }}{% endif %}{% if variance.invoice.synced_at %} ·
+        synced {{ variance.invoice.synced_at|ago }}{% endif %}.</p>
+      {% endif %}
       {% if runs %}
       <h2>Saved runs</h2>
       <div class="card"><div class="tablewrap"><table>
@@ -378,7 +532,13 @@
         <tr><td>{{ run.period_start|dshort }} – {{ run.period_end|dshort }}</td>
           <td><span class="chip {{ chipcls }}">{{ run.status|replace('_',' ') }}</span>
             {% if run.locked_at %}<span class="chip c-neutral"
-              title="Closed{% if run.locked_by %} by {{ run.locked_by }}{% endif %} — lines frozen">closed</span>{% endif %}</td>
+              title="Closed{% if run.locked_by %} by {{ run.locked_by }}{% endif %} — lines frozen">closed</span>{% endif %}
+            {% if run.edited_at %}<span class="chip c-warn"
+              title="Hand-edited{% if run.edited_by %} by {{ run.edited_by }}{% endif %} — the rate-card figures are kept on each line">edited</span>{% endif %}
+            {# Written by the invoice sync when the pushed invoice needs a human — it has
+               vanished from NetSuite. Never acted on automatically: re-billing a week is a
+               decision, not a sync side effect. #}
+            {% if run.sync_note %}<div class="flash crit" style="margin:6px 0 0">{{ run.sync_note }}</div>{% endif %}</td>
           <td class="r num">{{ run.lines|length }}</td>
           <td class="r num">${{ (run.lines|sum(attribute='amount'))|money }}</td>
           <td>{% if run_invoice.get(run.id) %}<a class="link" href="/c/{{ customer.slug }}/invoice/{{ run_invoice[run.id] }}">View invoice</a>

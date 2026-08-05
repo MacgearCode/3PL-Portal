@@ -51,9 +51,26 @@ def ensure_columns():
                  # location_scoped: added when the regular-brand model landed (2026-07-22). Existing
                  # rows get NULL (read as False); the sync coerces bool(). BOOLEAN is portable to both
                  # SQLite (INTEGER affinity) and Postgres; no DEFAULT so Postgres doesn't reject `0`.
-                 "customer": {"location_scoped": "BOOLEAN"},
+                 "customer": {"location_scoped": "BOOLEAN",
+                              # Narrow the invoice read to 3PL charge items (2026-08-05) —
+                              # needed once a customer bills to a record that also trades.
+                              "invoice_items_only": "BOOLEAN"},
                  # Explicit period close (2026-08-01). NULL = still an open draft, recomputable.
-                 "billing_run": {"locked_at": "TIMESTAMP", "locked_by": "VARCHAR"}}
+                 "billing_run": {"locked_at": "TIMESTAMP", "locked_by": "VARCHAR",
+                                 # Draft editing + invoice sync-back (2026-08-05).
+                                 "edited_at": "TIMESTAMP", "edited_by": "VARCHAR",
+                                 "sync_note": "TEXT"},
+                 # Draft editing (2026-08-05). Rows written before this have origin NULL, which
+                 # is treated as 'computed' by every reader (BillingLine.billable, the pending
+                 # payload's `or "computed"`, and the edit route's origin test), so no backfill
+                 # is required — but keep that true if you add a reader.
+                 "billing_line": {"origin": "VARCHAR", "computed_qty": "NUMERIC(14,2)",
+                                  "computed_rate": "NUMERIC(12,2)",
+                                  "computed_amount": "NUMERIC(14,2)", "ns_item_id": "VARCHAR"},
+                 # Richer invoice sync-back (2026-08-05).
+                 "invoice": {"currency": "VARCHAR", "amount_remaining": "NUMERIC(14,2)",
+                             "due_date": "DATE"},
+                 "invoice_line": {"ns_item_id": "VARCHAR"}}
     insp = inspect(engine)
     with engine.begin() as conn:
         for table, cols in additions.items():

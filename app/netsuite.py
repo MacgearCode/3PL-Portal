@@ -24,7 +24,7 @@ from datetime import date, datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import (Customer, InboundShipment, Invoice, InvoiceLine, Item,
+from .models import (BillingRun, Customer, InboundShipment, Invoice, InvoiceLine, Item,
                      ItemFulfilment, ItemFulfilmentLine, ItemReceipt, ItemReceiptLine,
                      PoLine, PurchaseOrder, StockOnHand, SyncLog)
 
@@ -40,6 +40,20 @@ def _date(s):
         except ValueError:
             continue
     return None
+
+
+def _datetime(s):
+    """NetSuite timestamps arrive as 'YYYY-MM-DD HH:MM:SS' or ISO; degrade to midnight."""
+    if not s:
+        return None
+    txt = str(s).replace("T", " ").split(".")[0].strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(txt, fmt)
+        except ValueError:
+            continue
+    d = _date(s)
+    return datetime(d.year, d.month, d.day) if d else None
 
 
 def _num(v):
@@ -74,21 +88,111 @@ def ingest_items(db: Session, c: Customer, rows: list[dict]) -> int:
 
 
 def ingest_invoices(db: Session, c: Customer, rows: list[dict]) -> int:
-    """rows: [{ns_invoice_id, tranid, trandate, status, total,
-              lines:[{charge_type?, description, qty, rate, amount}]}]"""
+    """rows: [{ns_invoice_id, tranid, trandate, status, total, currency, amount_remaining,
+              due_date, ns_lastmodified,
+              lines:[{ns_item_id, description, qty, rate, amount}]}]
+
+    NETSUITE IS THE SOURCE OF TRUTH FOR AN INVOICE. Lines are rebuilt from scratch every
+    sync, so an edit made on the invoice in NetSuite — a corrected quantity, a discounted
+    rate, an added line, a deleted one — lands here on the next full lane and flows straight
+    through to the customer's Invoices view. That was always true; what's new is that we now
+    also carry `ns_item_id`, which is what lets a line be matched back to the billing run
+    that raised it (`service.run_variance`). Descriptions can't do that job — they're free
+    text and get edited too.
+
+    `charge_type` on the line is derived from the item via the ChargeItem catalogue, not
+    taken from the payload: NetSuite has no idea what a charge_type is, and the mapping can
+    be corrected in the admin console without a re-sync.
+    """
+    by_item = service_charge_types(db)
     for r in rows:
         inv = _upsert(db, Invoice, "ns_invoice_id", str(r["ns_invoice_id"]),
                       customer_id=c.id, tranid=r.get("tranid"),
                       trandate=_date(r.get("trandate")), status=r.get("status"),
-                      total=_num(r.get("total")))
+                      total=_num(r.get("total")), currency=r.get("currency"),
+                      amount_remaining=_num(r.get("amount_remaining")),
+                      due_date=_date(r.get("due_date")),
+                      ns_lastmodified=_datetime(r.get("ns_lastmodified")),
+                      synced_at=datetime.utcnow())
         db.flush()
         for l in list(inv.lines):
             db.delete(l)
         for ln in r.get("lines", []):
-            db.add(InvoiceLine(invoice_id=inv.id, charge_type=ln.get("charge_type"),
+            ns_item = str(ln["ns_item_id"]) if ln.get("ns_item_id") else None
+            db.add(InvoiceLine(invoice_id=inv.id, ns_item_id=ns_item,
+                               charge_type=by_item.get(ns_item),
                                description=ln.get("description"), qty=_num(ln.get("qty")),
                                rate=_num(ln.get("rate")), amount=_num(ln.get("amount"))))
+    db.flush()
+    _prune_invoices(db, c, {str(r["ns_invoice_id"]) for r in rows})
+    _advance_pushed_runs(db, c)
     return len(rows)
+
+
+def _prune_invoices(db: Session, c: Customer, seen: set[str]) -> None:
+    """Drop cached invoices NetSuite no longer returns — but never off an empty pull.
+
+    The pull is the customer's complete invoice set (no date floor), so replace semantics are
+    correct: an invoice deleted in NetSuite, or a draft that was rejected and removed, should
+    leave the portal too. It also finally clears the sandbox invoice that has been sitting in
+    the production cache since cutover (production_cutover.md §2a) — `invoice` was upsert-only
+    and could not clear itself.
+
+    THE EMPTY-PULL GUARD IS NOT OPTIONAL. A missing transaction permission on the integration
+    role does not error in NetSuite — it row-filters and returns an empty result set from a
+    successful query (CLAUDE.md; it cost a day at go-live on item receipts). Without this
+    guard, one permission blip would delete every invoice in the portal and detach every
+    billing run from the invoice it created, which is a re-push and a double-bill away from
+    charging a customer twice. An empty pull is treated as "no news", never as "all deleted".
+    """
+    if not seen:
+        return
+    for inv in db.scalars(select(Invoice).where(Invoice.customer_id == c.id)).all():
+        if inv.ns_invoice_id in seen:
+            continue
+        # Flag, don't act: a run whose invoice has vanished keeps its status and its
+        # ns_invoice_id. Re-queueing it is a human decision — the invoice may have been
+        # deleted deliberately, or it may be a sync fault, and only one of those should
+        # result in the week being billed again.
+        for run in db.scalars(select(BillingRun).where(
+                BillingRun.customer_id == c.id,
+                BillingRun.ns_invoice_id == inv.ns_invoice_id)).all():
+            run.sync_note = (
+                f"The NetSuite invoice this run created ({inv.tranid or inv.ns_invoice_id}) "
+                f"is no longer in NetSuite. It was deleted or voided after the push — this "
+                f"period is unbilled. Re-queue it only after confirming that in NetSuite.")
+        db.delete(inv)
+
+
+def _advance_pushed_runs(db: Session, c: Customer) -> None:
+    """Move a run from `pushed` to `invoiced` once NetSuite has accepted its invoice.
+
+    Nothing did this before — only seed.py ever wrote 'invoiced', so every real run sat at
+    'pushed' forever and the status column stopped meaning anything after the push. The
+    portal creates the invoice as a DRAFT for approval, so `pushed` means "we created it" and
+    `invoiced` means "NetSuite has it as a live invoice". Anything still awaiting approval,
+    or rejected, stays at `pushed` — those need a human in NetSuite, not a status change.
+    """
+    pending_states = {"pending approval", "rejected", ""}
+    runs = db.scalars(select(BillingRun).where(
+        BillingRun.customer_id == c.id, BillingRun.status == "pushed",
+        BillingRun.ns_invoice_id != None)).all()                       # noqa: E711
+    if not runs:
+        return
+    inv_by_ns = {i.ns_invoice_id: i for i in db.scalars(
+        select(Invoice).where(Invoice.customer_id == c.id)).all()}
+    for run in runs:
+        inv = inv_by_ns.get(run.ns_invoice_id)
+        if inv and (inv.status or "").strip().lower() not in pending_states:
+            run.status = "invoiced"
+
+
+def service_charge_types(db: Session) -> dict[str, str]:
+    """ns_item_id -> charge_type. Local wrapper to keep the service import lazy (service
+    imports billing, which imports models — importing it at module scope here would make
+    the ingest layer depend on the read layer for one lookup)."""
+    from .service import charge_type_by_item
+    return charge_type_by_item(db)
 
 
 def ingest_purchase_orders(db: Session, c: Customer, rows: list[dict]) -> int:

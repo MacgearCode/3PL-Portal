@@ -26,8 +26,9 @@ const crypto = require('crypto');
 // (N8N_BLOCK_ENV_ACCESS_IN_NODE=true) — so existing inline wiring keeps working unchanged.
 //
 // To move to PRODUCTION, swap only the NetSuite-side values: ACCOUNT_ID (drop _SB1), the 4 TBA
-// secrets (prod integration+token), RESTLET_SCRIPT/DEPLOY (deploy the RESTlet in prod), and the
-// CHARGE_ITEMS ids (items created in prod will have different internalids). App side is unchanged.
+// secrets (prod integration+token) and RESTLET_SCRIPT/DEPLOY (deploy the RESTlet in prod).
+// Charge-item ids are NO LONGER part of this — they moved into the app's own catalogue
+// (portal admin console > Charge items) in 2026-08, so this node needs no edit for them.
 function env(name, fallback) {
   try {
     var v = $env[name];
@@ -67,9 +68,12 @@ const READ_ENTITIES = FAST
   : ['items', 'invoices', 'purchase_orders', 'inbound_shipments', 'item_receipts',
      'item_fulfilments', 'stock_on_hand'];
 const DO_WRITES = !FAST;   // billing draft-invoice push runs on the full lane only
-// charge_type -> NetSuite item internalid (for draft-invoice lines on push). Sandbox items.
-const CHARGE_ITEMS = { container_unload: '55070', putaway: '55071',
-                       storage: '55072', picking_so: '55073', picking_vrma: '55074' };
+// NOTE: the CHARGE_ITEMS map that used to live here is GONE (2026-08-05). Each pending
+// billing line now arrives from /admin/billing/pending with its own `ns_item_id`, resolved
+// from the app's charge-item catalogue (admin console > Charge items). Don't reintroduce a
+// map here: ad-hoc invoice lines pick their item per line, which a charge_type-keyed
+// constant cannot express, and the ids that were here were sandbox-only — a standing
+// cutover trap that made "go to production" mean "edit this workflow".
 // units-per-pallet custom item field id; blank = don't pull it. Needed for storage pallet/charge calc.
 const UPP_FIELD = 'custitem_pallet_quantity';
 // --------------------------------------------------------------------------------------------
@@ -121,6 +125,11 @@ const out = [];
 const cfg = await helpers.httpRequest({
   method: 'GET', url: `${APP_BASE}/admin/sync-config`, headers: appHeaders, json: true });
 const CUSTOMERS = cfg.customers || [];
+// The 3PL service item ids, from the app's charge-item catalogue. Sent with the invoices
+// read so the RESTlet can restrict it to invoices carrying one of them, for customers whose
+// bill-to record also trades (c.invoice_items_only). Managed in the admin console — this
+// node holds no item ids of its own.
+const CHARGE_ITEM_IDS = cfg.charge_item_ids || [];
 
 // 1) READS: pull each entity per customer and push to /admin/ingest
 const readFailures = [];   // {customer, entity} for each read that errored this run
@@ -129,6 +138,7 @@ for (const c of CUSTOMERS) {
     try {
       const params = Object.assign({ action: entity, since: SINCE }, c);
       if (entity === 'items' && UPP_FIELD) params.upp_field = UPP_FIELD;
+      if (entity === 'invoices') params.charge_item_ids = CHARGE_ITEM_IDS;
       const rows = await restlet(params);
       const r = await helpers.httpRequest({
         method: 'POST', url: `${APP_BASE}/admin/ingest`, headers: appHeaders,
@@ -188,8 +198,15 @@ if (DO_WRITES) try {
     method: 'GET', url: `${APP_BASE}/admin/billing/pending`, headers: appHeaders, json: true })).pending || [];
   for (const run of pending) {
     try {
-      const lines = run.lines.map((l) => ({ item_id: CHARGE_ITEMS[l.charge_type],
+      const lines = run.lines.map((l) => ({ item_id: l.ns_item_id, charge_type: l.charge_type,
         description: l.description, qty: l.qty, rate: l.rate }));
+      // The app refuses to queue a run with an unmapped line, so this should never fire —
+      // but a run queued before that check existed would still be sitting in the queue.
+      const unmapped = lines.filter((l) => !l.item_id).map((l) => l.charge_type);
+      if (unmapped.length) {
+        throw new Error(`no NetSuite item mapped for: ${unmapped.join(', ')} `
+                        + `— set it in the portal admin console > Charge items`);
+      }
       const res = await restlet({ action: 'create_invoice', ns_customer_id: run.ns_customer_id,
         ns_subsidiary_id: run.ns_subsidiary_id, ns_location_id: run.ns_location_id,
         memo: `3PL charges ${run.period_start}–${run.period_end}`, lines });

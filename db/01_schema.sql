@@ -18,6 +18,9 @@ CREATE TABLE customer (
     ns_subsidiary_id    TEXT,                           -- 2=MacGear AU (Mova), 3=MacGear NZ (Skriva)
     brand_label         TEXT,                           -- display label, e.g. 'Mova 3PL'
     location_label      TEXT,                           -- display label, e.g. '3PL Warehouse · Melbourne'
+    -- TRUE when the bill-to record also carries non-3PL trade (Mova invoices to Spacewalker
+    -- HK 11066): the invoice read is then narrowed to invoices containing a charge_item.
+    invoice_items_only  BOOLEAN NOT NULL DEFAULT FALSE,
     active              BOOLEAN NOT NULL DEFAULT TRUE,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -153,13 +156,21 @@ CREATE TABLE invoice (
     trandate            DATE,
     status              TEXT,                           -- open / paid
     total               NUMERIC(14,2),
+    -- Transaction currency. The push never sets it (NetSuite sources it from the customer
+    -- record), so this is the only way a mismatch with the AUD rate card becomes visible.
+    currency            TEXT,
+    amount_remaining    NUMERIC(14,2),                  -- foreignamountunpaid
+    due_date            DATE,
     ns_lastmodified     TIMESTAMPTZ,
     synced_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE invoice_line (
     id                  SERIAL PRIMARY KEY,
     invoice_id          INTEGER NOT NULL REFERENCES invoice(id) ON DELETE CASCADE,
-    charge_type         TEXT,
+    -- The NetSuite item. Descriptions are free text and get edited in NetSuite, so the item
+    -- is what matches a line back to the billing line that raised it (service.run_variance).
+    ns_item_id          TEXT,
+    charge_type         TEXT,                           -- derived from ns_item_id via charge_item
     description         TEXT,
     qty                 NUMERIC(14,2),
     rate                NUMERIC(12,2),
@@ -183,6 +194,13 @@ CREATE TABLE billing_run (
     -- them. NULL = open draft. period_start/period_end are always a whole Mon-Sun week.
     locked_at           TIMESTAMPTZ,
     locked_by           TEXT,                           -- user email that closed the period
+    -- Set the first time a human edits the draft's lines; blocks a recompute from silently
+    -- discarding those edits (main._recompute_blocked).
+    edited_at           TIMESTAMPTZ,
+    edited_by           TEXT,
+    -- Written by the invoice sync when the pushed invoice needs a human (it has vanished
+    -- from NetSuite). Never acted on automatically — a run's status is not rolled back.
+    sync_note           TEXT,
     UNIQUE (customer_id, period_start, period_end)
 );
 CREATE TABLE billing_line (
@@ -193,8 +211,34 @@ CREATE TABLE billing_line (
     qty                 NUMERIC(14,2),
     rate                NUMERIC(12,2),
     amount              NUMERIC(14,2),
-    source_refs         JSONB                           -- audit: which receipts/fulfilments/snapshots fed this line
+    source_refs         JSONB,                          -- audit: which receipts/fulfilments/snapshots fed this line
+    -- Draft editing. qty/rate/amount are what will be invoiced; computed_* are what the rate
+    -- card produced and are never overwritten by an edit, so the difference stays auditable.
+    -- origin: 'computed' | 'edited' | 'manual' | 'removed'. A removed COMPUTED line is kept
+    -- at amount 0 rather than deleted — a charge that silently vanishes is the exact failure
+    -- this module exists to prevent.
+    origin              TEXT NOT NULL DEFAULT 'computed',
+    computed_qty        NUMERIC(14,2),
+    computed_rate       NUMERIC(12,2),
+    computed_amount     NUMERIC(14,2),
+    ns_item_id          TEXT                            -- NetSuite item this line invoices against
 );
+
+-- The NetSuite service items a 3PL invoice line can be raised against (the `3PL - *` set).
+-- Replaced the CHARGE_ITEMS map hardcoded in the n8n Code node, whose ids were sandbox-only.
+-- charge_type non-NULL = the automated charge this item invoices; NULL = ad-hoc lines only.
+-- Global, not per-customer: these are Macgear's own items, one set per NetSuite account.
+CREATE TABLE charge_item (
+    id                  SERIAL PRIMARY KEY,
+    ns_item_id          TEXT NOT NULL UNIQUE,
+    name                TEXT NOT NULL,                  -- e.g. '3PL - Putaway Fee'
+    charge_type         TEXT,                           -- unique among non-NULL values
+    default_rate        NUMERIC(12,2),
+    active              BOOLEAN NOT NULL DEFAULT TRUE,
+    sort_order          INTEGER NOT NULL DEFAULT 100
+);
+CREATE UNIQUE INDEX charge_item_charge_type_uq ON charge_item (charge_type)
+    WHERE charge_type IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- Sync bookkeeping

@@ -54,20 +54,53 @@ define(['N/query', 'N/record'], function (query, record) {
   }
 
   // ---- READ actions (params are NetSuite internal ids from the app's customer record) ----
+  // Sanitise an id list arriving from the app before it goes into SQL. Everything here is
+  // server-to-server behind TBA, but this string is the only place app-supplied values reach
+  // a query, so it is filtered to integers rather than trusted.
+  function idList(vals) {
+    var out = [];
+    (vals || []).forEach(function (v) {
+      var n = Number(v);
+      if (n && isFinite(n)) out.push(String(Math.trunc(n)));
+    });
+    return out;
+  }
+
   function invoices(p) {
+    // The bill-to record may also be a trading entity (Mova invoices to Spacewalker HK
+    // `11066`), in which case its ordinary product invoices must not appear in the 3PL
+    // portal. When the app sends invoice_items_only + charge_item_ids, restrict to invoices
+    // carrying at least one 3PL service item. Off by default, and skipped when no ids are
+    // supplied — a customer whose invoices carry no charge item at all (Skriva's are $0
+    // product invoices) would otherwise lose its whole Invoices view.
+    var items = idList(p.charge_item_ids);
+    var itemFilter = (truthy(p.invoice_items_only) && items.length)
+      ? " AND EXISTS (SELECT 1 FROM transactionline il WHERE il.transaction=t.id " +
+        "AND il.mainline='F' AND il.item IN (" + items.join(',') + "))" : "";
+    // currency: the push never sets it (NetSuite sources it from the customer record), so
+    // pulling it back is the only way a rate-card/invoice currency mismatch is ever visible.
+    // amountremaining/duedate carry the payment state the portal shows next to the status.
     var heads = runSuiteQL(
-      "SELECT id, tranid, trandate, BUILTIN.DF(status) status, foreigntotal total " +
-      "FROM transaction WHERE type='CustInvc' AND entity=" + Number(p.ns_customer_id));
+      "SELECT t.id, t.tranid, t.trandate, BUILTIN.DF(t.status) status, t.foreigntotal total, " +
+      "BUILTIN.DF(t.currency) currency, t.foreignamountunpaid unpaid, t.duedate, " +
+      "t.lastmodifieddate " +
+      "FROM transaction t WHERE t.type='CustInvc' AND t.entity=" + Number(p.ns_customer_id) +
+      itemFilter);
     return heads.map(function (h) {
+      // item id (not just its display name) is what lets the app match a line edited in
+      // NetSuite back to the billing line that raised it — descriptions get edited too.
       var lines = runSuiteQL(
-        "SELECT BUILTIN.DF(item) item_name, memo, quantity, rate, netamount " +
+        "SELECT item, BUILTIN.DF(item) item_name, memo, quantity, rate, netamount " +
         "FROM transactionline WHERE transaction=" + Number(h.id) +
         " AND mainline='F' AND taxline='F' ORDER BY linesequencenumber");
       return {
         ns_invoice_id: String(h.id), tranid: h.tranid, trandate: h.trandate,
-        status: h.status, total: h.total,
+        status: h.status, total: h.total, currency: h.currency,
+        amount_remaining: h.unpaid, due_date: h.duedate,
+        ns_lastmodified: h.lastmodifieddate,
         lines: lines.map(function (l) {
-          return { description: l.memo || l.item_name, qty: l.quantity,
+          return { ns_item_id: l.item ? String(l.item) : null,
+                   description: l.memo || l.item_name, qty: l.quantity,
                    rate: l.rate, amount: l.netamount };
         })
       };
@@ -335,7 +368,15 @@ define(['N/query', 'N/record'], function (query, record) {
     // lines) and on each line for accounts that require it line-level.
     if (p.ns_location_id) rec.setValue({ fieldId: 'location', value: Number(p.ns_location_id) });
     if (p.memo) rec.setValue({ fieldId: 'memo', value: p.memo });
-    (p.lines || []).forEach(function (l) {
+    if (!(p.lines || []).length) throw new Error('create_invoice: no lines supplied');
+    (p.lines || []).forEach(function (l, i) {
+      // item_id is resolved app-side from the charge-item catalogue (it used to come from a
+      // CHARGE_ITEMS map hardcoded in the n8n node, whose ids were sandbox-only). Refuse
+      // rather than let NetSuite create a line against item `NaN`.
+      if (!Number(l.item_id)) {
+        throw new Error('create_invoice: line ' + (i + 1) + ' (' +
+                        (l.description || l.charge_type || '?') + ') has no NetSuite item id');
+      }
       rec.selectNewLine({ sublistId: 'item' });
       rec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item', value: Number(l.item_id) });
       rec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: Number(l.qty) });

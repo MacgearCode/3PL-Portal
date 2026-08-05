@@ -214,9 +214,24 @@ def compute_billing(db: Session, customer: Customer, period_start: date, period_
     return BillingResult(customer.id, period_start, period_end, lines, warnings)
 
 
-def result_to_run_kwargs(res: BillingResult) -> list[dict]:
-    """Shape ComputedLines into BillingLine column dicts (source_refs -> JSON)."""
+def result_to_run_kwargs(res: BillingResult,
+                         item_by_charge: dict[str, str] | None = None) -> list[dict]:
+    """Shape ComputedLines into BillingLine column dicts (source_refs -> JSON).
+
+    `item_by_charge` maps charge_type -> NetSuite item id (service.charge_item_for). It is
+    stamped on the line at save time rather than looked up at push time so that a run pushed
+    months later invoices against the item that was mapped when it was billed — the same
+    reason rate cards are effective-dated. A charge with no mapping saves with a NULL item
+    and is refused at queue time, loudly, instead of failing inside n8n at 2am.
+
+    computed_qty/computed_amount start life equal to qty/amount; they stay put when a human
+    edits the line, which is what makes the edit visible as a variance.
+    """
+    item_by_charge = item_by_charge or {}
     return [{
         "charge_type": l.charge_type, "description": l.label, "qty": l.qty,
         "rate": l.rate, "amount": l.amount, "source_refs": json.dumps(l.source_refs),
+        "origin": "computed", "computed_qty": l.qty, "computed_rate": l.rate,
+        "computed_amount": l.amount,
+        "ns_item_id": item_by_charge.get(l.charge_type),
     } for l in res.lines]

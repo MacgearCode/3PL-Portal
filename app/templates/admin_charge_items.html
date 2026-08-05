@@ -1,0 +1,55 @@
+{% extends "admin_base.html" %}
+{% set heading = "Charge items" %}
+{% block admin %}
+<div class="a-head"><h1>Charge items</h1></div>
+<p class="note">The NetSuite service items 3PL invoice lines are raised against. Mapping a
+  charge to an item is what lets a billing run be pushed; unmapped items are still available
+  as ad-hoc lines on a draft. This replaced the item ids that used to be hardcoded in the n8n
+  workflow — changing one here is all that's needed, with no workflow edit.</p>
+
+{% if saved %}<div class="flash ok">Charge items saved.</div>{% endif %}
+{% if error %}<div class="flash warn">{{ error }}</div>{% endif %}
+{% if unmapped %}<div class="flash warn"><b>These charges cannot be invoiced yet</b>
+  — they carry a rate but no NetSuite item, so a billing run containing them will be refused
+  at "Queue for NetSuite":
+  <ul class="warnlist">{% for ct in unmapped %}<li><code>{{ ct }}</code></li>{% endfor %}</ul></div>{% endif %}
+
+<form method="post" action="/admin/charge-items">
+<div class="card"><div class="tablewrap"><table>
+  <thead><tr>
+    <th>NetSuite item</th><th>Internal id</th><th>Automated charge</th>
+    <th class="r">Order</th><th class="r">Active</th></tr></thead>
+  <tbody>{% for i in items %}<tr>
+    <td class="prim">{{ i.name }}</td>
+    <td><span class="id">{{ i.ns_item_id }}</span></td>
+    <td>
+      <select name="ct_{{ i.id }}">
+        <option value="">— ad-hoc only —</option>
+        {% for ct in charge_types %}
+        <option value="{{ ct }}" {% if i.charge_type == ct %}selected{% endif %}>{{ ct }}</option>
+        {% endfor %}
+      </select>
+      {% for alias, target in aliases.items() %}{% if i.charge_type == target %}
+      <span class="sub2">also invoices <code>{{ alias }}</code></span>{% endif %}{% endfor %}
+    </td>
+    <td class="r"><input type="number" name="sort_{{ i.id }}" value="{{ i.sort_order }}"
+                         style="width:5em" step="10"></td>
+    <td class="r"><input type="checkbox" name="active_{{ i.id }}" value="on"
+                         {% if i.active %}checked{% endif %} style="width:auto"></td>
+  </tr>{% endfor %}</tbody>
+</table></div></div>
+
+<h2>Add an item</h2>
+<div class="card"><div class="frow">
+  <label>NetSuite internal id <input name="new_ns_item_id" placeholder="e.g. 23567"></label>
+  <label>Name <input name="new_name" placeholder="e.g. 3PL - Additional Labour"></label>
+  <span class="sub2">Added as ad-hoc only; map it to a charge above once it exists.</span>
+</div></div>
+
+<div class="formact"><button class="btn primary" type="submit">Save charge items</button></div>
+</form>
+
+<p class="note">A charge maps to exactly one item — assigning a charge already used elsewhere
+  moves it, rather than leaving two items claiming the same charge. Deactivating an item hides
+  it from new draft lines; runs already saved keep the item they were billed against.</p>
+{% endblock %}

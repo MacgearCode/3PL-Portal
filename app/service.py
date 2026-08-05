@@ -13,9 +13,9 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from .billing import active_rate_card, compute_billing
-from .models import (Customer, InboundShipment, Item, ItemFulfilment, ItemFulfilmentLine,
-                     ItemReceipt, ItemReceiptLine, Invoice, InvoiceLine, PurchaseOrder,
-                     StockOnHand)
+from .models import (BillingLine, BillingRun, ChargeItem, Customer, InboundShipment, Item,
+                     ItemFulfilment, ItemFulfilmentLine, ItemReceipt, ItemReceiptLine,
+                     Invoice, InvoiceLine, PurchaseOrder, RateCardLine, StockOnHand)
 
 # Line collections default to lazy="select", so "for r in rows: for l in r.lines" fires one
 # query per parent row. At two years of Mova's cadence that was 937 queries / 425 ms for the
@@ -34,6 +34,77 @@ def item_map(db: Session, customer_id: int) -> dict[str, str]:
 def item_names(db: Session, customer_id: int) -> dict[str, str]:
     rows = db.scalars(select(Item).where(Item.customer_id == customer_id)).all()
     return {i.ns_item_id: (i.description or i.sku) for i in rows}
+
+
+# --- charge items (the NetSuite service item catalogue) ----------------------
+# Macgear's live `3PL - *` production items, read off the item list 2026-08-05. Used to
+# bootstrap an empty `charge_item` table; after that the admin console is the source of
+# truth and this constant is never consulted again (so an id corrected in the UI stays
+# corrected). The five mapped charge_types replace the sandbox ids 55070-55074 that were
+# hardcoded in the n8n node — those never existed in production.
+#
+# picking_so and picking_vrma BOTH map to `3PL - Picking` (23563): picking is billed at
+# $1.00/unit regardless of whether the stock left on a sales order or a VRMA buy-in, so
+# they are one line on the invoice. The portal still computes them separately, because the
+# split is what tells you which dispatch path was used.
+DEFAULT_CHARGE_ITEMS = [
+    # (ns_item_id, name, charge_type, sort_order)
+    ("57082", "3PL - container unload", "container_unload", 10),
+    ("23560", "3PL - Putaway Fee", "putaway", 20),
+    ("23561", "3PL - Storage", "storage", 30),
+    ("23563", "3PL - Picking", "picking_so", 40),
+    ("36281", "3PL - Pick / Pack Service Charge", None, 50),
+    ("23565", "3PL - Freight", "shipping", 60),
+    ("23562", "3PL - Kitting", None, 70),
+    ("23564", "3PL - Packaging", None, 80),
+    ("23566", "3PL - System Fee", None, 90),
+    ("23567", "3PL - Additional Labour", None, 100),
+]
+# charge_types that share another item's mapping. Kept out of ChargeItem.charge_type (which
+# is one-per-item) so the catalogue stays a clean 1:1 map and this stays an explicit,
+# reviewable statement about billing rather than a duplicate row someone might "tidy up".
+CHARGE_TYPE_ALIASES = {"picking_vrma": "picking_so"}
+
+
+def bootstrap_charge_items(db: Session) -> int:
+    """Insert the default catalogue if the table is empty. Idempotent; never overwrites."""
+    if db.scalar(select(func.count()).select_from(ChargeItem)):
+        return 0
+    for ns_id, name, ct, order in DEFAULT_CHARGE_ITEMS:
+        db.add(ChargeItem(ns_item_id=ns_id, name=name, charge_type=ct, sort_order=order))
+    db.commit()
+    return len(DEFAULT_CHARGE_ITEMS)
+
+
+def charge_items(db: Session, active_only: bool = True) -> list[ChargeItem]:
+    stmt = select(ChargeItem).order_by(ChargeItem.sort_order, ChargeItem.name)
+    if active_only:
+        stmt = stmt.where(ChargeItem.active == True)  # noqa: E712
+    return list(db.scalars(stmt).all())
+
+
+def charge_item_for(db: Session, charge_type: str) -> ChargeItem | None:
+    """The item a computed charge invoices against, following the alias map."""
+    ct = CHARGE_TYPE_ALIASES.get(charge_type, charge_type)
+    return db.scalar(select(ChargeItem).where(ChargeItem.charge_type == ct,
+                                              ChargeItem.active == True))  # noqa: E712
+
+
+def charge_type_by_item(db: Session) -> dict[str, str]:
+    """ns_item_id -> charge_type, for tagging synced invoice lines back to a charge."""
+    return {ci.ns_item_id: ci.charge_type
+            for ci in db.scalars(select(ChargeItem)).all() if ci.charge_type}
+
+
+def unmapped_charge_types(db: Session) -> list[str]:
+    """Charge types that are actually priced somewhere but have no active NetSuite item.
+
+    Surfaced in the admin console: each one is a charge that will compute happily, save to a
+    draft, and then be refused at queue time — better to say so before the week is billed.
+    """
+    priced = {l.charge_type for l in db.scalars(
+        select(RateCardLine).where(RateCardLine.rate != 0)).all()}
+    return sorted(ct for ct in priced if charge_item_for(db, ct) is None)
 
 
 def storage_rate(db: Session, customer_id: int) -> float:
@@ -301,6 +372,71 @@ def invoice_with_lines(db: Session, customer_id: int, invoice_id: int):
              "rate": float(l.rate) if l.rate is not None else None,
              "amount": float(l.amount) if l.amount is not None else None} for l in lines]
     return inv, rows
+
+
+def run_variance(db: Session, run: BillingRun) -> dict | None:
+    """Compare a pushed run against the NetSuite invoice it created, line by line.
+
+    NetSuite is the source of truth for what was actually billed — anyone may edit the draft
+    invoice after the portal creates it, and the sync already pulls those edits back. What
+    was missing was any comparison: the run said $33,000 and the invoice said $31,500 and
+    nothing in the portal ever noticed. The run's own lines are deliberately NOT overwritten
+    by this — they stay the record of what Macgear asked for, and the difference is shown.
+
+    Matched on ns_item_id (resolved to charge_type), not description: descriptions are free
+    text in NetSuite and are routinely edited, item is not. Lines NetSuite has that the run
+    doesn't (someone added a charge in NetSuite) come back as `added`.
+
+    Returns None when there's nothing to compare — no invoice synced back yet.
+    """
+    if not run.ns_invoice_id:
+        return None
+    inv = db.scalar(select(Invoice).where(Invoice.customer_id == run.customer_id,
+                                          Invoice.ns_invoice_id == run.ns_invoice_id))
+    if inv is None:
+        return None
+
+    def key(charge_type, ns_item_id):
+        """Group by the item that will actually be invoiced, so the portal's separate
+        picking_so / picking_vrma lines compare against NetSuite's single Picking line."""
+        return ns_item_id or CHARGE_TYPE_ALIASES.get(charge_type, charge_type) or "?"
+
+    ours: dict[str, dict] = {}
+    for l in run.lines:
+        if not l.billable:
+            continue
+        item = l.ns_item_id or (getattr(charge_item_for(db, l.charge_type), "ns_item_id", None))
+        k = key(l.charge_type, item)
+        e = ours.setdefault(k, {"label": l.description or l.charge_type, "qty": 0.0, "amount": 0.0})
+        e["qty"] += float(l.qty or 0)
+        e["amount"] += float(l.amount or 0)
+
+    theirs: dict[str, dict] = {}
+    for l in inv.lines:
+        k = key(l.charge_type, l.ns_item_id)
+        e = theirs.setdefault(k, {"label": l.description or l.charge_type or "—",
+                                  "qty": 0.0, "amount": 0.0})
+        e["qty"] += float(l.qty or 0)
+        e["amount"] += float(l.amount or 0)
+
+    rows = []
+    for k in list(ours) + [k for k in theirs if k not in ours]:
+        a, b = ours.get(k), theirs.get(k)
+        rows.append({
+            "label": (a or b)["label"],
+            "run_qty": a["qty"] if a else None, "run_amount": a["amount"] if a else None,
+            "ns_qty": b["qty"] if b else None, "ns_amount": b["amount"] if b else None,
+            "delta": round((b["amount"] if b else 0.0) - (a["amount"] if a else 0.0), 2),
+            "state": "added" if not a else "removed" if not b else
+                     ("changed" if round(a["amount"] - b["amount"], 2) else "match"),
+        })
+    run_total = round(sum(r["run_amount"] or 0 for r in rows), 2)
+    ns_total = float(inv.total) if inv.total is not None else None
+    return {
+        "invoice": inv, "rows": rows, "run_total": run_total, "ns_total": ns_total,
+        "delta": None if ns_total is None else round(ns_total - run_total, 2),
+        "differs": any(r["state"] != "match" for r in rows),
+    }
 
 
 def rate_card_lines(db: Session, customer_id: int) -> list[dict]:

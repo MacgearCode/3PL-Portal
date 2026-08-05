@@ -40,6 +40,11 @@
     <span>Isolate 3PL stock to the location above</span>
   </label>
   <p class="sub2" style="margin:6px 0 0">Tick when the brand class also covers non-3PL (Macgear-owned) stock, so the sync must filter by the 3PL location <em>and</em> brand — e.g. Mova on its regular MOVA brand. Leave unticked when the brand is 3PL-exclusive and stock may span locations (e.g. Skriva).</p>
+  <label class="f checkbox" style="flex-direction:row;align-items:center;gap:8px;margin-top:12px">
+    <input type="checkbox" name="invoice_items_only" value="on" {% if c.invoice_items_only %}checked{% endif %} style="width:auto">
+    <span>Only show invoices carrying a 3PL charge item</span>
+  </label>
+  <p class="sub2" style="margin:6px 0 0">Tick when the customer id above is an existing trading entity that also receives ordinary product invoices — the sync then pulls only invoices containing one of the <a class="link" href="/admin/charge-items">3PL charge items</a>, so the rest stay out of the customer's portal. Leave unticked when the record is 3PL-only, or when its 3PL invoices carry no charge item at all (e.g. Skriva's $0 product invoices) — ticking it there would empty the Invoices view.</p>
 
   <h3 class="fsec">Rate card</h3>
   <p class="sub2" style="margin:0 0 12px">{% if is_new %}Sets the customer's first rate card (effective today).{% else %}Changing a rate creates a new effective-dated version (from today); past billing runs keep their original rates.{% endif %}</p>

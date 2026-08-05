@@ -3,8 +3,8 @@
 > ## ✅ EXECUTED 2026-07-27 — the read path is LIVE
 > RESTlet deployed to production, n8n repointed, cache purged, full sync run. All 6 visibility
 > views are populated with real Mova 3PL data and reconcile against NetSuite.
-> **Still open:** the billing write path (§1a customer record, §1b `CHARGE_ITEMS`) — "Queue for
-> NetSuite" errors until those land. See the *Billing roadmap* in `CLAUDE.md`.
+> **Billing write path: configured 2026-08-05** (§1a → customer `11066`; §1b → charge items now
+> live in the app). Not yet fired against production. See the *Billing roadmap* in `CLAUDE.md`.
 >
 > **What actually bit, in order:**
 > 1. **Item receipts came back empty with no error.** The integration role was missing
@@ -26,8 +26,11 @@
 >    22 in the next.** The charge is now dated off the item receipt's `trandate`. Same root cause
 >    family as fix 4 — the `inboundshipment` header's dates are simply not populated in this
 >    account. Don't trust any of them for billing.
-> 6. **A stale sandbox invoice is still in the production cache** — §2a, targeted purge, ⏳ not yet
->    run. `invoice` is upsert-only, so it will not clear itself.
+> 6. **A stale sandbox invoice is still in the production cache** — §2a, targeted purge. ✅ **No
+>    longer needs a manual purge as of 2026-08-05**: `ingest_invoices` now prunes invoices the
+>    pull stops returning, so the next full lane clears it. The prune is guarded on a non-empty
+>    pull — see the permission trap in §7; an unguarded one would delete every invoice the first
+>    time a permission blipped.
 >
 > Retain this document: it is the record of the verified production ids and the setup, and the
 > template for onboarding the next 3PL customer.
@@ -51,8 +54,8 @@ These are confirmed, not assumed — each was read out of production.
 | Vendor / supplier (`ns_supplier_id`) | **`10872`** — "Mova Technologies (AU) ($AUD)" | this is the `entity` on every open 3PL PO. **Careful:** 4 Mova vendors exist — `10504` is the **$USD** one, `10688` is NZ, `10749` is "Mova Collaborators". Use `10872`. |
 | Subsidiary (`ns_subsidiary_id`) | **`2`** — MacGear AU | needed for draft invoices |
 | Units-per-pallet field (`UPP_FIELD`) | **`custitem_pallet_quantity`** | ✅ populated (`12`) on all 5 on-hand 3PL items. `custitem_pallet_layer_quantity` is a *different* field (per layer) — do not use it. |
-| Customer (`ns_customer_id`) | ⚠️ **undecided — see §1** | |
-| `CHARGE_ITEMS` | ⚠️ **must be remapped — see §1** | sandbox ids `55070–55074` do not exist in production |
+| Customer (`ns_customer_id`) | **`11066`** — "Spacewalker Technology Hong Kong Co., Limited" (`03431`) | ✅ decided 2026-08-05. Currency **AUD**. An existing trading entity, so tick `invoice_items_only` (§1). |
+| Charge items | **in the app**, not n8n — Settings → Charge items | ✅ 2026-08-05. `CHARGE_ITEMS` deleted from the Code node; sandbox ids `55070–55074` never existed in production. Mapping table in `CLAUDE.md`. |
 
 ---
 
@@ -60,7 +63,23 @@ These are confirmed, not assumed — each was read out of production.
 
 Reads (all 6 portal views) work without any of these. Only the **draft-invoice push** is blocked.
 
-### a) Which customer record gets the 3PL service invoice?
+> ## ✅ (a) and (b) RESOLVED 2026-08-05 — both are recorded below as history.
+> **Bill-to: customer `11066` — "Spacewalker Technology Hong Kong Co., Limited"** (customer
+> number `03431`), Mova's HK entity, currency **AUD**. Not one of the four listed below, and not
+> a new dedicated record. Because it is an **existing trading entity**, Mova is set
+> `invoice_items_only` so the portal's Invoices view shows only invoices carrying a 3PL charge
+> item — otherwise Spacewalker's ordinary product invoices appear in the customer's portal.
+> **Charge items: mapped in the app, not in n8n.** `CHARGE_ITEMS` is gone from the Code node;
+> the mapping lives in `charge_item` and is edited at Settings → Charge items. The container
+> unload item **now exists** (`57082`), `23560` has been renamed "Putaway Fee", and the
+> duplicate `3PL - Storage Charge` (`36282`) is no longer in the item list. Current mapping is
+> the table in `CLAUDE.md` § *Charge items*.
+>
+> **Remaining to fire the first push:** set `11066` on Mova in `/admin/customers`, tick
+> "Only show invoices carrying a 3PL charge item", and redeploy `netsuite/3pl_restlet.js`
+> (the invoice read changed: item id, currency, payment fields, item filter).
+
+### a) Which customer record gets the 3PL service invoice? *(answered: `11066`)*
 Production has four Mova customers, none of which is obviously a 3PL billing entity:
 
 | id | name | subsidiary |
@@ -73,9 +92,10 @@ Production has four Mova customers, none of which is obviously a 3PL billing ent
 These look like sales-channel and warranty accounts. A dedicated "Mova 3PL" customer is probably
 the right answer — the service invoice and the $0 dispatch sales orders both key off it, so mixing
 it with an online-sales account will muddy both. Whatever you pick goes in `/admin/customers` →
-Mova → **NetSuite customer id**.
+Mova → **NetSuite customer id**. *(In the event: `11066`, the HK parent entity, was chosen over
+all of these and over creating a new record.)*
 
-### b) Which production items back the five charge types?
+### b) Which production items back the five charge types? *(answered — see the box above)*
 `CHARGE_ITEMS` in the n8n node maps `charge_type → NetSuite invoice item id`. The sandbox ids
 (`55070–55074`) are sandbox-only. Production already has a 3PL service item set — but the names
 don't line up 1:1 and **there is no container-unload item at all**:
@@ -95,6 +115,9 @@ Also note `3PL test item` (`55170`) exists in production — a leftover test art
 Two charge types can share one item if you'd rather not create a "Container unload" item — but
 then the invoice won't itemise it, and the portal's line detail won't match the NetSuite invoice.
 Recommend creating one non-inventory item, "3PL - Container Unload".
+*(In the event: the item was created — `57082` — and `23560` renamed to "Putaway Fee". The
+duplicates resolved themselves: `36282` is gone from the list, and `36281` is kept as an ad-hoc
+item rather than mapped to `picking_*`. `picking_so` and `picking_vrma` share `23563`.)*
 
 ### c) Confirm the container-unload volume
 The first billing run will charge **9 containers × $1,500 = $13,500** (see §5), off receipts
