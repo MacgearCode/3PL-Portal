@@ -630,6 +630,58 @@ def test_deleting_a_pushed_run_warns_that_the_week_can_be_billed_twice():
     db.close()
 
 
+def test_full_cycle_save_edit_delete_then_save_the_period_again():
+    """The everyday escape hatch: draft a week, edit it, decide it's wrong, bin it, start
+    over. Nothing about having edited a draft may leave the period poisoned once the run is
+    gone — the re-billing guard keys on a run EXISTING for the period, so a deleted run must
+    take its 'has-edits' and 'locked' state with it.
+    """
+    db, cust = _fresh()
+    _patch_cur()
+    admin = User(email="admin@macgeargroup.com", role="admin", password_hash="x", active=True)
+
+    # 1) save a draft for the week
+    run = _saved_run(db, cust)
+    first_id = run.id
+    original_total = sum(float(l.amount) for l in run.lines if l.billable)
+
+    # 2) edit it — change a line, drop a line, add an ad-hoc charge
+    asyncio.run(main.edit_billing_line("mova", run.id, _FakeRequest(
+        {"line_id": str(_line(run, "putaway").id), "qty": "999", "rate": "1.00"}), db))
+    asyncio.run(main.remove_billing_line("mova", run.id, _FakeRequest(
+        {"line_id": str(_line(run, "container_unload").id)}), db))
+    asyncio.run(main.add_billing_line("mova", run.id, _FakeRequest(
+        {"ns_item_id": "23562", "qty": "2", "rate": "125"}), db))
+    assert run.edited_at is not None
+    assert main._recompute_blocked(run) == "has-edits", "edited, so no silent recompute"
+
+    # 3) NOT closed and NOT queued
+    assert run.locked_at is None and run.status == "draft"
+
+    # 4) delete it
+    main.cur = lambda request: admin
+    resp = main.delete_billing_run("mova", first_id, _FakeRequest(), db)
+    assert "msg=run-deleted" in resp.headers["location"]
+    assert db.get(BillingRun, first_id) is None
+
+    # 5) the period is free again — nothing blocks it, and a fresh draft computes clean
+    assert main._existing_run(db, cust.id, MON, SUN) is None
+    assert main._recompute_blocked(None) is None
+    new_run = main._persist_billing_run(db, cust, MON, SUN,
+                                        compute_billing(db, cust, MON, SUN))
+    db.commit()
+    # (Not asserting a new id: SQLite reuses the rowid once the old row is gone, Postgres
+    # wouldn't, and nothing in the app depends on run ids being unique over time.)
+    assert new_run.status == "draft" and new_run.edited_at is None
+    assert new_run.locked_at is None and new_run.ns_invoice_id is None
+    assert new_run.sync_note is None
+    assert [l.origin for l in new_run.lines] == ["computed"] * len(new_run.lines), \
+        "the new draft is pure rate card — no trace of the deleted run's edits"
+    assert sum(float(l.amount) for l in new_run.lines if l.billable) == original_total, \
+        "and it prices the same as the original did"
+    db.close()
+
+
 def test_a_non_admin_cannot_delete_a_run():
     """Recomputing or closing a period is reversible; this is not."""
     db, cust = _fresh()
