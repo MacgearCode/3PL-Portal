@@ -1,8 +1,12 @@
 # NetSuite integration — live architecture
 
-> **LIVE on the NetSuite production account since 2026-07-27.** Reads are running on both lanes;
-> the billing write path is not yet configured (see the *Billing roadmap* in `CLAUDE.md`).
-> Cutover record + verified ids: `production_cutover.md`.
+> **LIVE on the NetSuite production account since 2026-07-27.** Reads are running on both lanes.
+> The billing write path is **configured** as of 2026-08-05 (bill-to `11066`, charge items mapped
+> in the app) but the first automated push to production has not been fired yet. See the *Billing
+> roadmap* in `CLAUDE.md`. Cutover record + verified ids: `production_cutover.md`.
+>
+> ⚠️ Both `netsuite/3pl_restlet.js` and `netsuite/n8n_3pl_sync.js` changed on 2026-08-05, and the
+> RESTlet again on 2026-08-06 (invoice line signs + `t.memo`). Redeploy both when pulling those.
 
 **The droplet app never talks to NetSuite.** It holds no NetSuite credentials and makes no
 outbound NetSuite calls. There is **no AI and no MCP** anywhere in the runtime. All NetSuite
@@ -32,19 +36,40 @@ communication is server-to-server between **n8n** (which signs Token-Based Auth)
     Responds `{customer, entity, ingested: N}` — **`ingested: 0` with no error item in the n8n run
     means the SuiteQL succeeded and returned nothing**, i.e. a role permission or subsidiary-access
     problem, not a code bug. See `production_cutover.md` §7.
-  - `GET  /admin/billing/pending` — billing runs queued (`ready_to_push`) with lines + customer ns ids.
+  - `GET  /admin/sync-config` — the customer list to loop over (+ `location_scoped`,
+    `invoice_items_only`) and `charge_item_ids`, the 3PL service item ids the invoice read uses to
+    narrow itself. Managed in the admin console, so neither is hardcoded in the node.
+  - `GET  /admin/billing/pending` — billing runs queued (`ready_to_push`) with customer ns ids and
+    lines. **Each line carries its own `ns_item_id`** (resolved app-side from the charge-item
+    catalogue), plus `origin` (`computed`/`edited`/`manual`); lines a human removed are omitted.
+    The app refuses to queue a run whose line has no item, so n8n should never see a null one.
   - `POST /admin/billing/pushed` — `{run_id, ns_invoice_id}` → marks the run pushed and links the invoice.
+  - `POST /admin/billing/generate` — drafts the previous Mon–Sun week per customer; idempotent.
+    Called at the END of the full lane, after all six reads land.
 - **Portal-internal routes** (session-authed, not for n8n), added with the paged list views:
   `GET /c/{slug}/{view}/rows` returns bare `<tr>`s for the Load more button;
   `GET /c/{slug}/{view}/export.csv` streams the whole current selection. Both enforce the same
   customer scoping as the page.
 
 ## Invoice lifecycle (why reads are authoritative)
-Queue a run → n8n creates a **draft** invoice in NetSuite → a person approves/edits it there →
-status moves Open→Paid/Overdue, credits may be raised. All of that lives in NetSuite, so the
-portal's Invoices view is **synced from NetSuite** (read action `invoices`, incl. lines). The app
-stores only `billing_run.ns_invoice_id` to link a run to its invoice — never a frozen copy.
-A period already queued/pushed/invoiced is locked against re-billing.
+Draft generated → optionally **edited in the portal** → closed → queued → n8n creates a **draft**
+invoice in NetSuite → a person approves/edits it there → status moves Open→Paid/Overdue, credits
+may be raised. All of that lives in NetSuite, so the portal's Invoices view is **synced from
+NetSuite** (read action `invoices`, incl. lines). The app stores only `billing_run.ns_invoice_id`
+to link a run to its invoice — never a frozen copy. A period already queued/pushed/invoiced is
+locked against re-billing, as is a draft that has been hand-edited (unless the operator explicitly
+discards the edits).
+
+Since 2026-08-05 the loop closes properly:
+- **Edits made in NetSuite come back with a variance.** `service.run_variance()` matches invoice
+  lines to billing lines on `ns_item_id` and shows changed / added-in-NetSuite / not-on-the-invoice
+  with a total delta. The run's own lines are **never** overwritten — NetSuite is truth for what was
+  billed, the run stays the record of what the rate card produced.
+- **`pushed` → `invoiced` now happens** (`netsuite._advance_pushed_runs`), once the synced invoice
+  leaves a pending-approval/rejected status. Before this, nothing but `seed.py` ever wrote
+  `invoiced`, so every real run stalled at `pushed`.
+- **A vanished invoice is flagged, not acted on.** If NetSuite stops returning an invoice a run
+  created, the run gets `sync_note` and keeps its status. Re-billing the week is a human decision.
 
 ## Deploy (one-time)
 1. **Enable** SuiteCloud features: Token-Based Authentication + RESTlets.
@@ -56,8 +81,12 @@ A period already queued/pushed/invoiced is locked against re-billing.
 4. **App env (droplet):** set `SYNC_TOKEN` to a long random secret (the app rejects ingest/billing calls
    without it). The app needs NO NetSuite credentials.
 5. **n8n:** Schedule Trigger → Code node with `netsuite/n8n_3pl_sync.js`; fill the constants
-   (account id, keys/token, script/deploy ids, `APP_BASE`, `SYNC_TOKEN`, each customer's NetSuite ids,
-   and `CHARGE_ITEMS` mapping each charge_type → its NetSuite invoice item id).
+   (account id, keys/token, script/deploy ids, `APP_BASE`, `SYNC_TOKEN`). Customer NetSuite ids and
+   the charge-item mapping are **not** in the node — both come from the app (`/admin/sync-config`
+   and the per-line `ns_item_id` on `/admin/billing/pending`), so adding a customer or remapping an
+   item is an admin-console edit, never a workflow edit. The `CHARGE_ITEMS` constant that used to
+   live here was removed 2026-08-05; don't reintroduce it (ad-hoc invoice lines pick their item per
+   line, which a charge_type-keyed constant can't express).
 6. **Cadence — two lanes feeding the same Code node** (mode set by a Set node in front of each):
    - **Fast lane (every 15 min):** Schedule Trigger → Set `{mode:"soh"}` → Code node. Pulls only
      `stock_on_hand` and skips the billing-push writes, keeping the portal's SOH view near-live without
@@ -75,10 +104,12 @@ Skriva: customer `10496`, vendor `10503`, location `2`, class `236`.
 
 ## Going to production
 See **`production_cutover.md`** — verified prod ids, the full TBA/integration/role/token setup with
-a per-hop smoke test and an error-signature table, the three decisions still open (3PL billing
-customer, `CHARGE_ITEMS` remap, container-unload item), the expected first-sync numbers, and the
+a per-hop smoke test and an error-signature table, the expected first-sync numbers, and the
 **cache purge that must happen before the first production sync** (most ingests upsert without
 pruning, so sandbox receipts/fulfilments/shipments would be billed a second time).
+The decisions that were open there are now closed (2026-08-05): the 3PL billing customer is
+`11066`, the charge items are mapped in the app, and the container-unload item exists (`57082`).
+`invoice` now prunes on a non-empty pull, so the stale sandbox invoice clears itself.
 
 **Secrets:** the n8n Code node reads the four TBA secrets + `SYNC_TOKEN` from **environment
 variables** (`NS_CONSUMER_KEY`, `NS_CONSUMER_SECRET`, `NS_TOKEN_ID`, `NS_TOKEN_SECRET`,

@@ -102,6 +102,36 @@ out on the billing preview and echoed into the n8n log by `/admin/billing/genera
 | containers marked received in NetSuite with no item receipt | not billable in **any** period until a receipt exists |
 | no SOH snapshot inside the period | storage silently uncharged for the week |
 
+## Draft editing + charge items (2026-08-05)
+
+The five charges above are what the rate card *computes*. Three additions sit on top:
+
+**`charge_item`** — the app's copy of the NetSuite `3PL - *` service item set, global (one per
+NetSuite account, not per customer), managed at admin console → **Charge items**. `charge_type`
+is non-NULL on the items backing an automated charge and unique among non-NULL values (partial
+unique index); NULL means the item is available to ad-hoc lines only. This replaced a
+`CHARGE_ITEMS` constant in the n8n node that held sandbox-only ids. `picking_vrma` reaches the
+same item as `picking_so` through `service.CHARGE_TYPE_ALIASES`, not a duplicate row.
+
+**`billing_line` gains `origin` + `computed_qty/rate/amount` + `ns_item_id`.** A draft's lines can
+be edited before pushing, which reverses the earlier "edit in NetSuite only" rule — but an edit
+never overwrites the computed trio, so every change is visible as a variance against the rate card.
+A removed *computed* line is kept at `origin='removed'`, amount 0, rather than deleted; a charge
+that silently disappears is the exact failure this module exists to prevent. `origin` NULL on rows
+predating the change reads as `computed` everywhere.
+
+**`invoice` gains `currency`, `amount_remaining`, `due_date`, `memo`, `period_start/end`;
+`invoice_line` gains `ns_item_id`.** `period_start/end` are **portal-owned** — the sync never
+writes them — because NetSuite has no billed-period field and `trandate` is the *raise* date, which
+may be backdated to fall inside payment terms. Period resolution is manual → billing run → memo.
+Invoice lines match back to billing lines on `ns_item_id`, never on description.
+
+⚠️ **`invoice` now prunes**, but only on a **non-empty** pull. A missing transaction permission
+returns an empty result set from a *successful* query (see the permission trap in
+`production_cutover.md` §7), and an unguarded prune would wipe every invoice and detach every run
+from the invoice it created — one re-push from double-billing. A run whose invoice vanishes gets
+`billing_run.sync_note` and keeps its status; re-billing a week is a human decision.
+
 ## Dispatch procedure (how stock leaves the 3PL)
 
 Two NetSuite paths move stock out, and they record **different economic events** — pick by the

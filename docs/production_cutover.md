@@ -443,7 +443,8 @@ docker exec -it n8n curl -s -o /dev/null -w '%{http_code}\n' \
     - `ACCOUNT_ID` → `840974`
     - the four TBA secrets → production integration + token
     - `RESTLET_SCRIPT` / `RESTLET_DEPLOY` → from the production deployment's External URL
-    - `CHARGE_ITEMS` → the five production item ids (§1b)
+    - ~~`CHARGE_ITEMS`~~ → **gone from the node since 2026-08-05.** Item ids now come from the app
+      per billing line; remap them in the admin console → **Charge items**, not here.
     - `UPP_FIELD` → `custitem_pallet_quantity` (already correct)
     - `SYNC_TOKEN` → matches the app's `.env`
     - `APP_BASE` → unchanged (`http://threepl:8000`)

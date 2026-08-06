@@ -149,11 +149,34 @@ WHERE t.type='ItemShip' AND t.entity IN (:cust, :vend) AND i.class=:class
   AND t.trandate BETWEEN :from AND :to
 ```
 
-**View 5 — invoices on the customer:**
+**View 5 — invoices on the customer** (extended 2026-08-05):
 ```sql
-SELECT t.id, t.tranid, t.trandate, BUILTIN.DF(t.status) status, t.foreigntotal total
-FROM transaction t WHERE t.type='CustInvc' AND t.entity=:cust ORDER BY t.trandate DESC
+SELECT t.id, t.tranid, t.trandate, BUILTIN.DF(t.status) status, t.foreigntotal total,
+       BUILTIN.DF(t.currency) currency, t.foreignamountunpaid unpaid, t.duedate, t.memo,
+       t.lastmodifieddate
+FROM transaction t WHERE t.type='CustInvc' AND t.entity=:cust
+  -- optional, when the bill-to record also carries non-3PL trade (Mova bills to Spacewalker
+  -- HK 11066): restrict to invoices containing a 3PL charge item.
+  AND EXISTS (SELECT 1 FROM transactionline il WHERE il.transaction=t.id
+              AND il.mainline='F' AND il.item IN (:charge_item_ids))
+ORDER BY t.trandate DESC
 ```
+Lines:
+```sql
+SELECT item, BUILTIN.DF(item) item_name, memo, -quantity qty, rate, -netamount amount
+FROM transactionline WHERE transaction=:id AND mainline='F' AND taxline='F'
+ORDER BY linesequencenumber
+```
+⚠️ **`quantity` and `netamount` are NEGATIVE on a CustInvc's revenue lines** while the header's
+`foreigntotal` is positive — income is a credit, so `transactionline` stores it from the ledger's
+side. Negate them (**not** `ABS()`: a genuine credit line such as a discount is stored *positive*,
+so `ABS()` would flip it into a charge and inflate the invoice). Same family as the fulfilment
+ASSET-line sign above. `item` (the internal id, not just its display name) is what lets a line
+edited in NetSuite be matched back to the billing line that raised it — descriptions get edited.
+⚠️ **`t.memo` is the only field carrying the period billed.** `trandate` is when the invoice was
+raised and may be deliberately backdated to fall inside payment terms (`INAU250127` is dated 31 Jul
+and bills 27 Jul–2 Aug), so never infer a period from it. The portal stamps
+`3PL charges <from>–<to>` into the memo on every draft it creates for exactly this reason.
 
 **Container-unload charge + Stock-on-order link — inbound shipments (VALIDATED 2026-06-30):**
 Run against production (NANOLEAF brand, class 31, which has real inbound shipments). Key gotchas:
@@ -198,6 +221,8 @@ is later edited, and a partiallyReceived→received transition re-dates it — r
    `VRMA000327`), but Mova has made **no dispatches at all yet**, so neither picking charge has ever
    been exercised on Mova data. Worth a check on the first one — and note **VRMA is Mova's default
    dispatch path**, so this is the common case, not the edge case.
-5. **Still open — the billing write path.** `create_invoice` has never run in production: the 3PL
-   billing customer record is undecided and `CHARGE_ITEMS` is unmapped (no container-unload item
-   exists in production). See `production_cutover.md` §1 and the *Billing roadmap* in `CLAUDE.md`.
+5. **Still open — `create_invoice` has never run in production.** It is now *configured* though
+   (2026-08-05): the 3PL billing customer is **`11066`** (Spacewalker Technology Hong Kong Co.,
+   Limited, currency AUD), the container-unload item now exists (**`57082`**), and the charge-item
+   mapping moved out of the n8n node into the app. What remains untested against production is the
+   write itself. See `production_cutover.md` §1 and the *Billing roadmap* in `CLAUDE.md`.

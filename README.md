@@ -5,8 +5,10 @@ Customer visibility portal + weekly billing automation for Macgear's 3PL service
 NetSuite-backed, multi-tenant. First customer: **Mova**. Reference: **Skriva**.
 
 **Status: LIVE on NetSuite production since 2026-07-27** — all 6 visibility views are syncing real
-data. The billing write path (auto-generated draft invoice → manual push) is the remaining work;
-see the *Billing roadmap* in `CLAUDE.md`.
+data. The billing write path is **built and configured** (2026-08-05/06): weekly drafts generate
+automatically, can be edited before pushing, and invoice edits made in NetSuite sync back with a
+per-line variance. The first automated push to production hasn't been fired yet. See the *Billing
+roadmap* in `CLAUDE.md`.
 
 | Doc | What's in it |
 |---|---|
@@ -16,6 +18,8 @@ see the *Billing roadmap* in `CLAUDE.md`.
 | `docs/production_cutover.md` | the production cutover record: verified ids, TBA/role setup, cache purge, what went wrong |
 | `docs/data_model.md` | schema + sync design (v1) |
 | `docs/deploy.md` | droplet + sandbox deploy walkthrough |
+| `docs/3PL-Portal-Overview.pptx` | 5-slide internal overview for the business (screenshots are indicative demo data, not live figures) |
+| `docs/3PL-Portal-Email-Update.md` | ready-to-send email introducing the tool internally |
 
 ## Run locally
 ```powershell
@@ -40,7 +44,8 @@ app/
   models.py      ORM (mirrors db/01_schema.sql) — the read cache + billing tables
   service.py     read-side: cache -> the 6 portal views + overview tiles
   billing.py     billing engine: cache + rate card -> the 5 weekly service charges
-  netsuite.py    ingest layer: upserts rows n8n pushes in (the app never calls NetSuite)
+  netsuite.py    ingest layer: upserts rows n8n pushes in (the app never calls NetSuite);
+                 also orients invoice line signs and advances pushed runs to invoiced
   perms.py       roles + per-user view permissions
   security.py    pbkdf2 password hashing + signed-cookie sessions + reset-token helpers
   notify.py      send_reset_email: POSTs the reset link to an n8n webhook (or logs it locally)

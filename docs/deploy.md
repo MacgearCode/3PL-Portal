@@ -15,11 +15,15 @@ against the **NetSuite sandbox** first, then flip a handful of constants to go t
   but confirm them in the sandbox UI before trusting them.
 - **Mova is live in production as of 2026-07-27** (stock landed 24 Jul: 9 containers / 6,369 units).
   Supplier `10872`, class `237`, location `49`, subsidiary `2` — see `production_cutover.md` §0.
-  Its `ns_customer_id` is still **undecided** (no Mova record is a 3PL billing entity), which is
-  why the draft-invoice push is not yet configured. The seed still ships `TBD` for both ids.
-- The service items in `CHARGE_ITEMS` (container_unload, putaway, storage, picking_so, picking_vrma)
-  must exist in the sandbox for `create_invoice` to work. Skriva's rate card is seeded at $0, so a
-  Skriva billing run produces a $0 draft — perfect for proving the push loop without real charges.
+  Its `ns_customer_id` is **`11066`** ("Spacewalker Technology Hong Kong Co., Limited", currency
+  AUD), decided 2026-08-05. The seed still ships `TBD`, so set it in `/admin/customers` on any
+  fresh environment.
+- The 3PL service items must exist in whichever account you're pointing at for `create_invoice`
+  to work. They are **no longer listed in the n8n node** — since 2026-08-05 the mapping lives in
+  the app (`charge_item`, admin console → **Charge items**) and each pending billing line carries
+  its own `ns_item_id`. On a sandbox, remap the ids there; no workflow edit. Skriva's rate card is
+  seeded at $0, so a Skriva billing run produces a $0 draft — perfect for proving the push loop
+  without real charges.
 
 ## 1. App on the droplet (Docker, behind Caddy)
 1. Copy this repo to the droplet (the GitHub repo, see README) and `cd` in.
@@ -57,8 +61,11 @@ In `netsuite/n8n_3pl_sync.js` fill the constants:
 - `ACCOUNT_ID = '1234567_SB1'` — the node lowercases + swaps `_`→`-` for the URL host automatically.
 - `CONSUMER_KEY/SECRET`, `TOKEN_ID/SECRET`, `RESTLET_SCRIPT`, `RESTLET_DEPLOY` from steps 2–3.
 - `APP_BASE = 'http://threepl:8000'`, `SYNC_TOKEN` = the app's `SYNC_TOKEN`.
-- `CUSTOMERS`: keep Skriva for sandbox testing; verify its ids resolve in the sandbox.
-- `CHARGE_ITEMS`: each charge_type → its NetSuite invoice item internalid (in the sandbox).
+- `CUSTOMERS`: not in the node — fetched from the app's `/admin/sync-config`, so adding a customer
+  in the admin console is all that's needed.
+- Charge items: **not in the node either** (the old `CHARGE_ITEMS` constant was removed 2026-08-05).
+  Each pending billing line arrives from `/admin/billing/pending` carrying its own `ns_item_id`,
+  resolved from the app's catalogue. Remap ids in the admin console → **Charge items**.
 
 Wire: **Schedule Trigger → this Code node.** Run once manually first and read the node output
 (it returns one item per read/push step, with `error` keys on any failure).
