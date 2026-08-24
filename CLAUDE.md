@@ -248,15 +248,72 @@ default by role, overridable per user (`app_user.allowed_views` JSON; NULL = rol
 **Admin console** (`/admin/users`, `/admin/customers`, admin-only): create/edit/deactivate users (assign
 role + customer + visible views), and edit per-customer rate cards — a rate change
 writes a NEW effective-dated `RateCard` so past billing runs reprice correctly.
-**Password reset / set-password:** public **Forgot password** flow (`GET/POST /forgot`, `GET/POST /reset`)
-and an admin **"Get set-password link"** button — admins no longer type passwords. New users are created
-with an empty `password_hash` (login blocked) and given a link to set their own. Tokens are single-use:
-only `sha256(token)` + expiry are stored on `app_user` (`reset_token_hash`, `reset_expires_at`, ~45 min).
-On create / on button press the admin console **displays the link for the admin to copy** and send however
-they like (Teams, normal email) — no external dependency. Automatic email is optional/best-effort: if
-`N8N_RESET_WEBHOOK_URL` is set the link is also POSTed to an n8n webhook (`app/notify.py`) that mails it;
-unset = link only shown in the UI + logged to console. `/forgot` never reveals whether an address exists.
-(n8n email delivery was deferred — the copy-the-link UI is the working path; wire the webhook later if wanted.)
+### Invites, password reset & account emails (rebuilt 2026-08-12)
+**✅ Delivery verified end-to-end 2026-08-24** — invite and self-service reset both arrive from
+`noreply@macgeargroup.com` via the n8n workflow and Graph app-only. App registration
+`Macgear Portal Mailer` = `dfbb1ab2-7014-490c-91be-950112bd468f` (tenant `9370e6f0-…`); the
+secret lives only in the n8n credential. ⚠️ **Outstanding: the Exchange application access
+policy** (`docs/email_delivery.md` Part 1 step 3) — until it's applied the app registration can
+send as ANY Macgear mailbox, not just `noreply@`. Blocked on Organization Management /
+Exchange Administrator, which Aaron does not hold; `New-ApplicationAccessPolicy` is simply
+absent from his Exchange session.
+⚠️ **The From display name is still "No Reply", and should be `Macgear Group`.** Also blocked
+on permissions — and oddly, `Get-Mailbox`/`Set-Mailbox` cannot see the object at all from
+Aaron's session ("couldn't be found on SY6P282A02DC004", the same DC every time) while Graph
+sends as it without complaint, so it reads as DC affinity on top of the role gap. The From
+name comes from the **mailbox**, never the payload, so there is nothing to change in this
+repo — don't go looking for it in `notify.py`.
+Both are IT tasks; `docs/it_request_portal_mailer.md` is the forwardable ask and its banner
+lists exactly these two.
+Also **not yet on the droplet** — tested from localhost only.
+Admins never type anyone's password. Both flows mint a **single-use** token; only
+`sha256(token)` + expiry + purpose are stored (`reset_token_hash`, `reset_expires_at`,
+`reset_purpose`), and both land on the same public `/reset?token=` page, which varies its
+wording by purpose.
+
+| | Invite | Self-service reset |
+|---|---|---|
+| Triggered by | admin presses **Send invite** | user uses **Forgot password?** on `/login` |
+| `reset_purpose` | `invite` | `reset` (**NULL also reads as `reset`** — a token minted before the column existed *was* a 45-min reset) |
+| TTL | `INVITE_TOKEN_TTL_MIN`, 7 days | `RESET_TOKEN_TTL_MIN`, 45 min |
+
+- **Creating a user emails nothing.** It used to auto-mint a link on save; now create redirects
+  to `/admin/users/{id}?msg=created` and the admin presses **Send invite** (with an optional
+  personal note that goes into the email) once they've checked role/customer/views and the
+  address. Purpose is **derived from account state, never submitted** — `invite` iff
+  `password_hash` is empty — so the button label can't disagree with what the server minted.
+- **`/admin/users` status is three-state** (`not invited` / `invited` + expiry / `active`, plus
+  `disabled`), from the shared `_user_status()`. The old two-state "invite pending" chip said
+  the same thing for "created a fortnight ago, never sent" and "sent, waiting on them".
+  Row action is a **link** to `#invite`, not a one-click POST: the note lives on that panel,
+  and this app has no CSRF tokens, so state-changing controls stay off the list page.
+- **Minting kills the previous token**, and **disabling an account kills its outstanding link**
+  (otherwise someone sets a password, is told they're set, then bounces off `/login`).
+- **Email goes through n8n** (`n8n/3pl_account_email.json` → Graph **app-only** → shared mailbox
+  `noreply@macgeargroup.com`, display name "Macgear Group", Reply-To = the inviting admin). The
+  app holds no mail creds. Full walkthrough: **`docs/email_delivery.md`**.
+  App-only via a **dedicated** app registration (`Macgear Portal Mailer`), restricted to that
+  one mailbox by an Exchange `ApplicationAccessPolicy`. Deliberately *not* the n8n Microsoft
+  Outlook node — that is delegated auth and always sends as the signed-in mailbox — and
+  deliberately not the shared `Macgear Claude Agent` app id, so scoping it to `noreply@` can't
+  break the other Graph automations on that id.
+- **The app composes subject + body; n8n only sends.** Same reasoning as moving `CHARGE_ITEMS`
+  out of the n8n node: copy in a Code/Set node is invisible to git, untestable, and lost on a
+  workflow re-import. Don't "improve" this by moving the wording into n8n.
+- Delivery is **best-effort** — `send_account_link()` returns "the webhook accepted it", not
+  "it arrived" — so the **copyable link stays visible either way** and the UI says plainly
+  whether anything was emailed. With the webhook unset, the whole composed email is logged, so
+  `./run.ps1` works offline.
+- ⚠️ **`/admin/users/{id}/send-link` re-renders instead of redirecting, on purpose.** The
+  response must carry the RAW token for the copy-link fallback, and a redirect could only do
+  that via a query string — leaving a live single-use token in the Caddy access log, browser
+  history and the `Referer` of every asset on the next page. Don't tidy it into a 303.
+- Guards: the app refuses to demote, disable or delete the **last active admin** (there is no
+  shared-password fallback here, so that lockout needs psql to undo); a duplicate email is a
+  message, not a 500; `/forgot` never reveals whether an address exists **and its mail-bomb
+  throttle returns a byte-identical response**, or the throttle would itself become the
+  enumeration oracle.
+- **Known gaps:** no CSRF tokens anywhere in the app, and no rate limit on `/login`.
 Seeded logins (dev — CHANGE): admin@macgeargroup.com/admin123,
 ops@macgeargroup.com/internal123, viewer@mova.com/mova123. Auth is always on now (no shared-password mode).
 

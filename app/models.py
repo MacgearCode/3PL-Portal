@@ -370,6 +370,10 @@ class User(Base):
     # Single-use password-reset / set-password link: store only the token's SHA-256 digest.
     reset_token_hash: Mapped[str | None] = mapped_column(String, nullable=True)
     reset_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 'invite' (7 days) or 'reset' (45 min). Only decides the TTL at mint time and the
+    # wording afterwards — validity is reset_expires_at alone — so NULL on a token minted
+    # before this column existed reads as 'reset', which is what it actually was.
+    reset_purpose: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class SyncLog(Base):

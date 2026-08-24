@@ -1,0 +1,107 @@
+{
+  "name": "3PL Portal — account emails",
+  "settings": {
+    "timezone": "Australia/Brisbane",
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "3pl-account-email",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-220, 0],
+      "webhookId": "3pl-account-email",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "3PL Portal Webhook Token"
+        }
+      },
+      "notes": "Header-auth credential, NOT an IF node comparing a literal. The secret is then encrypted with N8N_ENCRYPTION_KEY, never appears in a workflow export, and n8n rejects a bad token with 403 before any node runs."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate what the portal sent before spending a Graph call on it. The app composes\n// subject + body (see app/notify.py — deliberately, so the copy lives in git), so this node\n// only checks the shape and never rewrites the wording.\nconst b = $input.first().json.body || {};\nfor (const k of ['to', 'subject', 'body']) {\n  if (!b[k] || String(b[k]).trim() === '') {\n    throw new Error(`3PL account email: missing \"${k}\" in payload`);\n  }\n}\nif (!String(b.to).includes('@')) {\n  throw new Error(`3PL account email: \"${b.to}\" is not an address`);\n}\nreturn [{ json: {\n  to: String(b.to).trim(),\n  subject: String(b.subject),\n  body: String(b.body),\n  purpose: b.purpose || 'reset',\n  // Empty replyTo is fine — the Graph node below omits the header when it's blank.\n  replyTo: (b.reply_to || '').trim(),\n} }];"
+      },
+      "id": "validate",
+      "name": "Validate payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.microsoft.com/v1.0/users/noreply@macgeargroup.com/sendMail",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ message: { subject: $json.subject, body: { contentType: 'Text', content: $json.body }, toRecipients: [ { emailAddress: { address: $json.to } } ], replyTo: $json.replyTo ? [ { emailAddress: { address: $json.replyTo } } ] : [] }, saveToSentItems: true }) }}",
+        "options": {}
+      },
+      "id": "send",
+      "name": "Send via Graph (noreply@)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [220, 0],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "oAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Macgear Portal Mailer (client credentials)"
+        }
+      },
+      "notes": "App-only Graph sendMail from the 'Macgear Portal Mailer' app registration, scoped by an Exchange application access policy to noreply@ ONLY (docs/email_delivery.md Part 1). App-only can send as a SHARED mailbox — no licence, cannot be signed into, and no person in the loop. The n8n Microsoft Outlook node cannot do this: it uses DELEGATED auth and always sends as the signed-in mailbox. The From display name comes from the MAILBOX ('Macgear Group'), not from this payload. Change the address in the URL to change the sender. replyTo is set to the inviting admin by the app."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, purpose: $json.purpose || 'reset' }) }}",
+        "options": {}
+      },
+      "id": "ok",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [460, -100]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseCode": 502,
+        "responseBody": "={{ JSON.stringify({ ok: false, error: ($json.error && $json.error.message) || 'send failed' }) }}",
+        "options": {}
+      },
+      "id": "fail",
+      "name": "Respond error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [460, 100],
+      "notes": "The portal reads only the HTTP status — it logs a failure and keeps showing the copyable link. This body is for whoever is reading the Executions list."
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "Validate payload", "type": "main", "index": 0 }]]
+    },
+    "Validate payload": {
+      "main": [[{ "node": "Send via Graph (noreply@)", "type": "main", "index": 0 }]]
+    },
+    "Send via Graph (noreply@)": {
+      "main": [
+        [{ "node": "Respond OK", "type": "main", "index": 0 }],
+        [{ "node": "Respond error", "type": "main", "index": 0 }]
+      ]
+    }
+  }
+}

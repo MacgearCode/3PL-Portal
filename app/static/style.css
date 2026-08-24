@@ -353,7 +353,8 @@ tfoot td{padding:12px 16px;font-weight:650;border-top:2px solid var(--line);back
 .fsec{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin:4px 0 12px;font-weight:700}
 .frow{display:flex;gap:16px;flex-wrap:wrap}
 .f{flex:1;min-width:220px;display:block;font-size:12.5px;color:var(--muted);margin-bottom:14px}
-.f input,.f select{display:block;width:100%;margin-top:5px;padding:9px 11px;border:1px solid var(--line);border-radius:8px;font-size:14px;font-family:inherit;color:var(--ink)}
+.f input,.f select,.f textarea{display:block;width:100%;margin-top:5px;padding:9px 11px;border:1px solid var(--line);border-radius:8px;font-size:14px;font-family:inherit;color:var(--ink)}
+.f textarea{background:var(--surface);resize:vertical;line-height:1.45}
 .perms{border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:6px 0 16px;background:var(--surface-2)}
 .perms-h{font-weight:650;font-size:14px;margin-bottom:10px}
 .checks{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px 16px}

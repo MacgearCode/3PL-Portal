@@ -6,7 +6,8 @@
 > source of truth over any prose here. The shipped schema is `db/01_schema.sql` plus the
 > `ensure_columns()` migrations in `app/db.py` (columns added after v1: `stock_on_hand.synced_at`,
 > `item_receipt.po_tranid`, `po_line.ns_inbound_shipment`, `inbound_shipment.expected_date`,
-> `inbound_shipment.container_no`, `customer.location_scoped`, and the `app_user` reset columns).
+> `inbound_shipment.container_no`, `customer.location_scoped`, and the `app_user` reset columns
+> `reset_token_hash` / `reset_expires_at` / `reset_purpose`).
 >
 > Two model facts that were open questions in v0 and are now settled:
 > - **Stock isolation is per-customer**, via `customer.location_scoped` — brand class alone for

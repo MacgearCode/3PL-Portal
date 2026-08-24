@@ -9,6 +9,7 @@ import csv
 import io
 import json
 import os
+import time
 from datetime import date, datetime, timedelta
 
 from fastapi import Depends, FastAPI, Request
@@ -16,15 +17,16 @@ from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
                                StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import netsuite, perms, service
+from . import netsuite, notify, perms, service
 from .billing import compute_billing, result_to_run_kwargs
 from .db import Base, SessionLocal, engine, ensure_columns, get_db
 from .models import (CHARGE_TYPES, BillingLine, BillingRun, ChargeItem, Customer, Invoice,
                      RateCard, RateCardLine, User)
-from .notify import send_reset_email
+from .notify import INVITE, RESET, in_words, send_account_link
 from .security import hash_password, hash_token, make_reset_token, sign, unsign, verify_password
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -157,6 +159,9 @@ COOKIE_NAME = "threepl_session"
 # Absolute base for links we email out (behind the Caddy proxy request.base_url is unreliable).
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 RESET_TOKEN_TTL_MIN = int(os.environ.get("RESET_TOKEN_TTL_MIN", "45"))
+# An invite is emailed to someone who may not read it until tomorrow, so it gets a much
+# longer life than a reset the user just asked for seconds ago.
+INVITE_TOKEN_TTL_MIN = int(os.environ.get("INVITE_TOKEN_TTL_MIN", "10080"))   # 7 days
 # token-authed server-to-server endpoints (n8n) + public reset flow bypass the login cookie
 _EXEMPT_EXACT = {"/login", "/logout", "/forgot", "/reset",
                  "/admin/ingest", "/admin/sync-config",
@@ -226,18 +231,37 @@ def logout():
 
 
 # --- password reset / set-password (public, single-use token) ----------------
-def _issue_reset_link(db: Session, user: User, request: Request) -> str:
-    """Mint a single-use token, persist only its hash + expiry, attempt to email the link,
-    and return the link so the admin UI can show it for manual copy (email delivery is
-    best-effort / optional — see app/notify.py)."""
+def _issue_reset_link(db: Session, user: User, request: Request, *, purpose: str = RESET,
+                      note: str = "", invited_by: str = "") -> tuple[str, bool]:
+    """Mint a single-use token, persist only its hash + expiry + purpose, attempt to email
+    the link, and return (link, delivered).
+
+    `delivered` is "the webhook accepted it", not "it arrived" — so the admin UI keeps
+    showing the link for manual copy either way. A disabled account gets ("", False) and no
+    token at all: minting one would let someone set a password they still can't sign in with.
+
+    Minting KILLS any earlier token for this user. That's correct (a superseded link must
+    die) but it has to be said in the UI, or an admin re-sends "to be safe" and breaks the
+    link the user is halfway through clicking.
+    """
+    if not user.active:
+        return "", False
+    ttl = INVITE_TOKEN_TTL_MIN if purpose == INVITE else RESET_TOKEN_TTL_MIN
     raw = make_reset_token()
     user.reset_token_hash = hash_token(raw)
-    user.reset_expires_at = datetime.utcnow() + timedelta(minutes=RESET_TOKEN_TTL_MIN)
+    user.reset_expires_at = datetime.utcnow() + timedelta(minutes=ttl)
+    user.reset_purpose = purpose
     db.commit()
     base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
     link = f"{base}/reset?token={raw}"
-    send_reset_email(user.email, link)
-    return link
+    delivered = send_account_link(to=user.email, url=link, purpose=purpose, note=note,
+                                  invited_by=invited_by, expires_min=ttl)
+    return link, delivered
+
+
+def _purpose_of(user: User | None) -> str:
+    """NULL reads as 'reset' — that is what a token minted before the column existed was."""
+    return (user.reset_purpose if user and user.reset_purpose else RESET)
 
 
 def _user_for_reset_token(db: Session, token: str) -> User | None:
@@ -246,7 +270,38 @@ def _user_for_reset_token(db: Session, token: str) -> User | None:
     user = db.scalar(select(User).where(User.reset_token_hash == hash_token(token)))
     if not user or not user.reset_expires_at or user.reset_expires_at < datetime.utcnow():
         return None
+    # A link minted before the account was disabled must stop working. Redeeming it isn't an
+    # access hole (login and the middleware both check `active`) but it would let someone set
+    # a password, be told they're all set, and then bounce straight off the sign-in page.
+    if not user.active:
+        return None
     return user
+
+
+def _purpose_for_token(db: Session, token: str) -> str:
+    """Purpose for the /reset page even when the token has EXPIRED — _user_for_reset_token
+    returns None for both "no such token" and "expired", so the expired page would otherwise
+    tell an invited customer to go and reset a password they never had. Safe to look up
+    without a validity check: the token is 256 bits of entropy, not a guessable address."""
+    if not token:
+        return RESET
+    user = db.scalar(select(User).where(User.reset_token_hash == hash_token(token)))
+    return _purpose_of(user)
+
+
+def _user_status(user: User) -> tuple[str, str, str]:
+    """(chip class, label, detail) — shared by the users list and the user form so the two
+    can never disagree. Three real states, not two: "created and never invited" used to
+    render identically to "invited, waiting on them", which hid accounts nobody ever sent."""
+    if not user.active:
+        return "c-crit", "disabled", ""
+    if user.password_hash:
+        return "c-good", "active", ""
+    live = user.reset_expires_at and user.reset_expires_at > datetime.utcnow()
+    if live:
+        # %d %b to match the "d"/"dshort" template filters (and %-d is glibc-only anyway).
+        return "c-info", "invited", user.reset_expires_at.strftime("expires %d %b %H:%M")
+    return "c-warn", "not invited", ""
 
 
 @app.get("/forgot", response_class=HTMLResponse)
@@ -254,14 +309,41 @@ def forgot_form(request: Request):
     return templates.TemplateResponse(request, "forgot_password.html", {"sent": False})
 
 
+# Mail-bomb guard for /forgot, keyed by address and by client IP. Honest about what it is:
+# in-process, single-worker, forgotten on restart — an "anyone can email-bomb a customer by
+# holding down F5" guard, not a security control. Deliberately NOT applied to the admin
+# buttons: an admin pressing send twice means it.
+_FORGOT_WINDOW_S = 15 * 60
+_FORGOT_MAX_EMAIL = 3
+_FORGOT_MAX_IP = 10
+_forgot_hits: dict[str, list[float]] = {}
+
+
+def _forgot_allowed(email: str, ip: str) -> bool:
+    now = time.monotonic()
+    if len(_forgot_hits) > 500:          # bounded: this must not grow without limit
+        _forgot_hits.clear()
+    ok = True
+    for key, cap in ((f"e:{email}", _FORGOT_MAX_EMAIL), (f"i:{ip}", _FORGOT_MAX_IP)):
+        hits = [t for t in _forgot_hits.get(key, []) if now - t < _FORGOT_WINDOW_S]
+        if len(hits) >= cap:
+            ok = False
+        hits.append(now)
+        _forgot_hits[key] = hits
+    return ok
+
+
 @app.post("/forgot", response_class=HTMLResponse)
 async def forgot_submit(request: Request, db: Session = Depends(get_db)):
     form = await request.form()
     email = (form.get("email", "") or "").strip().lower()
     user = db.scalar(select(User).where(User.email == email))
-    if user and user.active:
-        _issue_reset_link(db, user, request)
-    # Identical response whether or not the address matched — no account enumeration.
+    ip = request.client.host if request.client else "?"
+    if user and user.active and _forgot_allowed(email, ip):
+        _issue_reset_link(db, user, request, purpose=RESET)
+    # Identical response whether or not the address matched, AND whether or not we were
+    # throttled — a different page for any of those cases would turn this endpoint into the
+    # account-enumeration oracle the single generic response exists to prevent.
     return templates.TemplateResponse(request, "forgot_password.html", {"sent": True})
 
 
@@ -270,7 +352,8 @@ def reset_form(request: Request, token: str = "", db: Session = Depends(get_db))
     user = _user_for_reset_token(db, token)
     return templates.TemplateResponse(request, "reset_password.html",
                                       {"invalid": user is None,
-                                       "token": token if user else "", "error": ""})
+                                       "token": token if user else "", "error": "",
+                                       "purpose": _purpose_for_token(db, token)})
 
 
 @app.post("/reset")
@@ -282,16 +365,18 @@ async def reset_submit(request: Request, db: Session = Depends(get_db)):
     user = _user_for_reset_token(db, token)
     if not user:
         return templates.TemplateResponse(request, "reset_password.html",
-                                          {"invalid": True, "token": "", "error": ""})
+                                          {"invalid": True, "token": "", "error": "",
+                                           "purpose": _purpose_for_token(db, token)})
     if len(pw) < 10 or pw != pw2:
         return templates.TemplateResponse(
             request, "reset_password.html",
-            {"invalid": False, "token": token,
+            {"invalid": False, "token": token, "purpose": _purpose_of(user),
              "error": "Passwords must match and be at least 10 characters."},
             status_code=400)
     user.password_hash = hash_password(pw)
     user.reset_token_hash = None
     user.reset_expires_at = None
+    user.reset_purpose = None          # spent token leaves nothing behind
     db.commit()
     return RedirectResponse("/login?msg=reset", status_code=303)
 
@@ -962,18 +1047,41 @@ def admin_users(request: Request, db: Session = Depends(get_db)):
     cust_names = {c.id: c.name for c in db.scalars(select(Customer)).all()}
     rows = [{"u": u, "customer": cust_names.get(u.customer_id, "—"),
              "views": len(perms.effective_views(u)),
-             "custom": bool(u.allowed_views)} for u in users]
+             "custom": bool(u.allowed_views),
+             "status": _user_status(u)} for u in users]
     return templates.TemplateResponse(request, "admin_users.html",
-                                      {"rows": rows, "section": "users"})
+                                      {"rows": rows, "section": "users",
+                                       "msg": request.query_params.get("msg", "")})
 
 
-def _user_form_ctx(request: Request, db: Session, u: User | None,
-                   notice: str = "", reset_link: str = "") -> dict:
+def _user_form_ctx(request: Request, db: Session, u: User | None, notice: str = "",
+                   reset_link: str = "", error: str = "", delivered: bool = False,
+                   posted: dict | None = None) -> dict:
     selected = perms.effective_views(u) if u else perms.role_default("customer")
+    if posted and posted.get("views") is not None:
+        selected = posted["views"]
     return {"section": "users", "u": u, "customers": _customers(db),
             "view_keys": perms.VIEW_KEYS, "selected": selected,
-            "role": u.role if u else "customer",
-            "notice": notice, "reset_link": reset_link}
+            "role": (posted or {}).get("role") or (u.role if u else "customer"),
+            "notice": notice, "reset_link": reset_link, "error": error,
+            "delivered": delivered, "posted": posted or {},
+            "status": _user_status(u) if u else None,
+            "purpose": INVITE if (u and not u.password_hash) else RESET,
+            "invite_ttl": in_words(INVITE_TOKEN_TTL_MIN),
+            "reset_ttl": in_words(RESET_TOKEN_TTL_MIN)}
+
+
+def _only_active_admin(db: Session, u: User) -> bool:
+    """True when u is the last thing standing between us and a locked-out portal.
+
+    Unlike Vendor Credit Claims there is no shared-password fallback here ("auth is always
+    on now"), so demoting, disabling or deleting the final active admin can only be undone
+    with psql on the droplet."""
+    if u.role != "admin" or not u.active:
+        return False
+    others = db.scalar(select(func.count()).select_from(User).where(
+        User.role == "admin", User.active.is_(True), User.id != u.id))
+    return not others
 
 
 @app.get("/admin/users/{user_id}", response_class=HTMLResponse)
@@ -982,8 +1090,11 @@ def admin_user_form(request: Request, user_id: int | None = None, db: Session = 
     if (r := _deny_non_admin(request)):
         return r
     u = db.get(User, user_id) if user_id else None
+    notice = {"created": "Account created — nothing has been emailed yet. Send them an "
+                         "invite below when you're ready.",
+              "saved": "Changes saved."}.get(request.query_params.get("msg", ""), "")
     return templates.TemplateResponse(request, "admin_user_form.html",
-                                      _user_form_ctx(request, db, u))
+                                      _user_form_ctx(request, db, u, notice=notice))
 
 
 @app.post("/admin/users/{user_id}")
@@ -1004,42 +1115,87 @@ async def admin_user_save(request: Request, user_id: int | None = None,
     active = form.get("active") == "on"
 
     u = db.get(User, user_id) if user_id else None
+    posted = {"email": email, "role": role, "customer_id": cust_id,
+              "views": selected, "active": active}
+
+    def _reject(msg: str):
+        return templates.TemplateResponse(request, "admin_user_form.html", _user_form_ctx(
+            request, db, u, error=msg, posted=posted), status_code=400)
+
+    if not email:
+        return _reject("An email address is required.")
+    # Pre-check the unique constraint: without it the most obvious admin typo — re-adding
+    # someone who already exists — was an unhandled IntegrityError and a bare 500.
+    clash = db.scalar(select(User).where(User.email == email,
+                                        User.id != (u.id if u else -1)))
+    if clash:
+        return _reject(f"{email} already has an account — edit that one instead.")
+    if u is not None and _only_active_admin(db, u) and (role != "admin" or not active):
+        return _reject("This is the only active admin — promote someone else first, or you "
+                       "lock everyone out of the portal.")
+
     invite = False
     if u is None:
-        if not email:
-            return RedirectResponse("/admin/users/new", status_code=303)
-        # New users have no password — they set their own via a set-password link.
+        # New users have no password — they set their own from an invite link. Nothing is
+        # emailed here: the admin reviews role/customer/views first, then presses Send invite.
         u = User(email=email, password_hash="")
         db.add(u)
         invite = True
-    elif email:
+    else:
         u.email = email
     u.role = role
     u.customer_id = cust_id
     u.allowed_views = allowed
     u.active = active
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:               # lost a race with another admin; same message
+        db.rollback()
+        return _reject(f"{email} already has an account — edit that one instead.")
     if invite:
-        link = _issue_reset_link(db, u, request)   # the "set your password" link
-        return templates.TemplateResponse(request, "admin_user_form.html", _user_form_ctx(
-            request, db, u,
-            notice="User created. Send them the set-password link below (also emailed if email is configured).",
-            reset_link=link))
-    return RedirectResponse("/admin/users", status_code=303)
+        return RedirectResponse(f"/admin/users/{u.id}?msg=created", status_code=303)
+    return RedirectResponse("/admin/users?msg=saved", status_code=303)
 
 
-@app.post("/admin/users/{user_id}/send-reset")
-def admin_user_send_reset(user_id: int, request: Request, db: Session = Depends(get_db)):
+@app.post("/admin/users/{user_id}/send-link")
+async def admin_user_send_link(user_id: int, request: Request,
+                               db: Session = Depends(get_db)):
+    """Email an invite (no password yet) or a password-reset link, with an optional note.
+
+    Returns the rendered form rather than a redirect ON PURPOSE. The response has to carry
+    the RAW token so the copy-the-link fallback still works when mail fails, and a redirect
+    could only do that via a query string — which would leave a live single-use token in the
+    Caddy access log, the browser history and the Referer of every asset on the next page.
+    Don't "tidy" this into a 303.
+    """
     if (r := _deny_non_admin(request)):
         return r
     u = db.get(User, user_id)
     if not u:
-        return RedirectResponse("/admin/users", status_code=303)
-    link = _issue_reset_link(db, u, request)
+        return RedirectResponse("/admin/users?msg=no-user", status_code=303)
+    form = await request.form()
+    return _send_link_response(request, db, u, form.get("note", "") or "")
+
+
+def _send_link_response(request: Request, db: Session, u: User, note: str):
+    if not u.active:
+        return templates.TemplateResponse(request, "admin_user_form.html", _user_form_ctx(
+            request, db, u,
+            error="This account is disabled — tick Active and save before sending a link."),
+            status_code=400)
+    # Purpose comes from account state, never from the form: one fewer client-controlled
+    # field, and the button label follows the same rule so the UI can't disagree with what
+    # the server actually minted.
+    purpose = INVITE if not u.password_hash else RESET
+    me = cur(request)
+    link, delivered = _issue_reset_link(db, u, request, purpose=purpose,
+                                        note=note.strip()[:500],
+                                        invited_by=me.email if me else "")
+    what = "Invite" if purpose == INVITE else "Password reset link"
+    notice = (f"{what} emailed to {u.email}." if delivered
+              else f"{what} generated for {u.email}, but nothing was emailed.")
     return templates.TemplateResponse(request, "admin_user_form.html", _user_form_ctx(
-        request, db, u,
-        notice="Set-password link generated. Copy it below and send it to the user (also emailed if email is configured).",
-        reset_link=link))
+        request, db, u, notice=notice, reset_link=link, delivered=delivered))
 
 
 @app.post("/admin/users/{user_id}/delete")
@@ -1048,6 +1204,11 @@ def admin_user_delete(user_id: int, request: Request, db: Session = Depends(get_
         return r
     u = db.get(User, user_id)
     me = cur(request)
+    if u and _only_active_admin(db, u):
+        return templates.TemplateResponse(request, "admin_user_form.html", _user_form_ctx(
+            request, db, u,
+            error="This is the only active admin — promote someone else before deleting it."),
+            status_code=400)
     if u and u.id != me.id:          # never delete yourself
         db.delete(u)
         db.commit()

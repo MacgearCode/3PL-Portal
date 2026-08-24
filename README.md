@@ -48,7 +48,8 @@ app/
                  also orients invoice line signs and advances pushed runs to invoiced
   perms.py       roles + per-user view permissions
   security.py    pbkdf2 password hashing + signed-cookie sessions + reset-token helpers
-  notify.py      send_reset_email: POSTs the reset link to an n8n webhook (or logs it locally)
+  notify.py      send_account_link: composes the invite / reset email and POSTs it to an n8n
+                 webhook (or logs the whole email locally). See docs/email_delivery.md
   seed.py        seeds Mova/Skriva + rate cards + users (+ demo cache unless SEED_DEMO=0)
   templates/ static/   server-rendered portal UI
                  _rows.html = table-row macros shared by the full page and the Load more

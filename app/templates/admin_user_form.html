@@ -5,23 +5,33 @@
   <a class="link" href="/admin/users">← All users</a></div>
 
 {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
 
 {% if reset_link %}
 <div class="card resetlink">
-  <p class="sub2">Single-use set-password link for <strong>{{ u.email }}</strong> — expires soon. Copy and send it to the user:</p>
+  <p class="sub2">
+    {% if delivered %}Emailed to <strong>{{ u.email }}</strong>. Copy the link below as well
+      if it doesn't turn up — ask them to check their junk folder first.
+    {% else %}<strong>Nothing was emailed</strong> — either email isn't configured on this
+      environment or the send failed. Send this link to {{ u.email }} yourself.
+    {% endif %}
+  </p>
   <div class="copyrow">
     <input id="resetlink" type="text" readonly value="{{ reset_link }}">
     <button type="button" class="btn" onclick="navigator.clipboard.writeText(document.getElementById('resetlink').value);this.textContent='Copied'">Copy</button>
   </div>
+  <p class="sub2">Single use{% if u.reset_expires_at %}, expires {{ u.reset_expires_at|d }}
+    at {{ u.reset_expires_at.strftime('%H:%M') }}{% endif %}. Any earlier link for this
+    account is now dead, so don't generate another while they're using this one.</p>
 </div>
 {% endif %}
 
 <form class="card formcard" method="post" action="{{ '/admin/users/' ~ u.id if u else '/admin/users/new' }}">
   <div class="frow">
-    <label class="f">Email<input name="email" type="email" value="{{ u.email if u else '' }}" required></label>
+    <label class="f">Email<input name="email" type="email" value="{{ posted.email or (u.email if u else '') }}" required></label>
     <label class="f">Role
       <select name="role" id="role" onchange="applyRole()">
-        {% for r in ROLES %}<option value="{{ r }}" {{ 'selected' if (u.role if u else 'customer') == r }}>{{ r }}</option>{% endfor %}
+        {% for r in ROLES %}<option value="{{ r }}" {{ 'selected' if role == r }}>{{ r }}</option>{% endfor %}
       </select>
     </label>
   </div>
@@ -29,14 +39,13 @@
     <label class="f" id="custwrap">Customer (for customer role)
       <select name="customer_id">
         <option value="">— none (internal) —</option>
-        {% for c in customers %}<option value="{{ c.id }}" {{ 'selected' if u and u.customer_id == c.id }}>{{ c.name }}</option>{% endfor %}
+        {% for c in customers %}<option value="{{ c.id }}" {{ 'selected' if (posted.customer_id or (u.customer_id if u else None)) == c.id }}>{{ c.name }}</option>{% endfor %}
       </select>
     </label>
   </div>
-  <p class="sub2">{% if u %}Users set their own password. Use “Get set-password link” below
-    to generate a link for {{ u.email }} (shown here to copy; also emailed if email is configured).{% else %}
-    On create, a set-password link is generated for the user to set their own password —
-    no password is entered here.{% endif %}</p>
+  <p class="sub2">{% if u %}Users always set their own password — use the panel below to send
+    {{ u.email }} a link.{% else %}No password is set here. Once the account exists you'll get
+    a <strong>Send invite</strong> button, so you choose when they hear about it.{% endif %}</p>
 
   <div class="perms">
     <div class="perms-h">Visible views <span class="sub2">— defaults by role; tick to override per user</span></div>
@@ -47,7 +56,7 @@
     </div>
   </div>
 
-  <label class="chk"><input type="checkbox" name="active" {{ 'checked' if (u.active if u else True) }}> Active (can sign in)</label>
+  <label class="chk"><input type="checkbox" name="active" {{ 'checked' if (posted.active if posted else (u.active if u else True)) }}> Active (can sign in)</label>
 
   <div class="formact">
     <button class="btn primary" type="submit">{{ "Save changes" if u else "Create user" }}</button>
@@ -56,10 +65,33 @@
 </form>
 
 {% if u %}
-<div class="formact">
-  <form method="post" action="/admin/users/{{ u.id }}/send-reset">
-    <button class="btn" type="submit">Get set-password link</button>
+{% set is_invite = purpose == 'invite' %}
+<section class="card formcard" id="invite">
+  <h2>{{ "Send invite" if is_invite else "Send password reset link" }}</h2>
+  <p class="sub2">
+    {% if is_invite %}{{ u.email }} has no password yet. This emails them a single-use link,
+      valid for <strong>{{ invite_ttl }}</strong>, to choose their own — nobody at Macgear
+      ever sees it.
+    {% else %}{{ u.email }} already has a password. This emails a reset link valid for
+      <strong>{{ reset_ttl }}</strong> — short on purpose, since they're expecting it.
+    {% endif %}
+    Replies come back to you, not to the sending mailbox.
+  </p>
+  <form method="post" action="/admin/users/{{ u.id }}/send-link">
+    <label class="f">Personal note <span class="sub2">— optional, included in the email</span>
+      <textarea name="note" rows="3" maxlength="500"
+        placeholder="e.g. Hi Sam, this is the portal we talked about on Tuesday — shout if anything looks off."></textarea>
+    </label>
+    <div class="formact">
+      <button class="btn primary" type="submit" {{ 'disabled' if not u.active }}>
+        {{ "Send invite" if is_invite else "Send reset link" }}</button>
+      {% if not u.active %}<span class="sub2">Disabled accounts can't be sent a link — tick
+        Active and save first.</span>{% endif %}
+    </div>
   </form>
+</section>
+
+<div class="formact">
   <span class="grow"></span>
   <form method="post" action="/admin/users/{{ u.id }}/delete" onsubmit="return confirm('Delete {{ u.email }}? This cannot be undone.')">
     <button class="btn danger" type="submit">Delete user</button>

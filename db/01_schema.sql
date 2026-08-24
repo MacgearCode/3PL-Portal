@@ -268,7 +268,8 @@ CREATE TABLE app_user (              -- "user" is reserved in Postgres
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_login          TIMESTAMPTZ,
     reset_token_hash    TEXT,                           -- SHA-256 of a single-use reset/set-password token
-    reset_expires_at    TIMESTAMPTZ                     -- NULL when no active token
+    reset_expires_at    TIMESTAMPTZ,                    -- NULL when no active token
+    reset_purpose       TEXT                            -- 'invite' (7d) | 'reset' (45m); NULL reads as 'reset'
 );
 
 CREATE TABLE sync_log (

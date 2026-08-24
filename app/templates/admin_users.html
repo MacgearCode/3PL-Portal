@@ -5,6 +5,11 @@
   <h1>Users</h1>
   <a class="btn primary" href="/admin/users/new">+ New user</a>
 </div>
+{% set flash = {'created': 'Account created — send them an invite when you\'re ready.',
+                'saved': 'Changes saved.',
+                'deleted': 'User deleted.',
+                'no-user': 'That user no longer exists.'}.get(msg) %}
+{% if flash %}<p class="notice">{{ flash }}</p>{% endif %}
 <div class="card"><div class="tablewrap"><table>
   <thead><tr><th>Email</th><th>Role</th><th>Customer</th><th class="r">Views</th><th>Status</th><th></th></tr></thead>
   <tbody>{% for r in rows %}<tr>
@@ -12,8 +17,11 @@
     <td><span class="chip {{ 'c-info' if r.u.role=='admin' else 'c-good' if r.u.role=='internal' else 'c-neutral' }}">{{ r.u.role }}</span></td>
     <td>{{ r.customer }}</td>
     <td class="r num">{{ r.views }}{% if r.custom %} <span class="sub2">(custom)</span>{% endif %}</td>
-    <td>{% if r.u.active %}<span class="chip c-good">active</span>{% else %}<span class="chip c-crit">disabled</span>{% endif %}{% if not r.u.password_hash %} <span class="chip c-neutral">invite pending</span>{% endif %}</td>
-    <td class="r"><a class="link" href="/admin/users/{{ r.u.id }}">Edit</a></td>
+    <td><span class="chip {{ r.status[0] }}">{{ r.status[1] }}</span>{% if r.status[2] %}
+      <span class="sub2">{{ r.status[2] }}</span>{% endif %}</td>
+    <td class="r">{% if not r.u.password_hash and r.u.active %}<a class="link"
+        href="/admin/users/{{ r.u.id }}#invite">{{ 'Re-send' if r.status[1] == 'invited' else 'Invite' }}</a>
+      &nbsp;{% endif %}<a class="link" href="/admin/users/{{ r.u.id }}">Edit</a></td>
   </tr>{% endfor %}</tbody>
 </table></div></div>
 {% endblock %}

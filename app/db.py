@@ -47,7 +47,11 @@ def ensure_columns():
                  "item_receipt": {"po_tranid": "VARCHAR"},
                  "po_line": {"ns_inbound_shipment": "VARCHAR"},
                  "inbound_shipment": {"expected_date": "DATE", "container_no": "VARCHAR"},
-                 "app_user": {"reset_token_hash": "VARCHAR", "reset_expires_at": "TIMESTAMP"},
+                 # reset_purpose: added when invites got their own 7-day TTL (2026-08-12).
+                 # NULL means a token minted before that, which was always a 45-min reset —
+                 # so every reader treats NULL as 'reset'. It never affects validity.
+                 "app_user": {"reset_token_hash": "VARCHAR", "reset_expires_at": "TIMESTAMP",
+                              "reset_purpose": "VARCHAR"},
                  # location_scoped: added when the regular-brand model landed (2026-07-22). Existing
                  # rows get NULL (read as False); the sync coerces bool(). BOOLEAN is portable to both
                  # SQLite (INTEGER affinity) and Postgres; no DEFAULT so Postgres doesn't reject `0`.

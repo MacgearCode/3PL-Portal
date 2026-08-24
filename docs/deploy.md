@@ -31,6 +31,10 @@ against the **NetSuite sandbox** first, then flip a handful of constants to go t
    - `APP_SECRET`, `SYNC_TOKEN`, `PGPASSWORD` → `openssl rand -hex 32` (use the same password in `DATABASE_URL`).
    - `SHARED_NETWORK` → the network Caddy + n8n are on (`docker network ls`).
    - Leave `SEED_DEMO=0` so no fake cache rows are planted.
+   - `PUBLIC_BASE_URL` → the real public origin. **Not optional.** Blank means invite and
+     reset links get built from `request.base_url`, which behind Caddy comes out as
+     `http://threepl:8000/` — unopenable, and it now goes straight to a customer's inbox.
+   - `N8N_RESET_WEBHOOK_URL` → leave **blank** for now; see §1.5.
 3. `docker compose up -d --build`. First boot creates the schema and seeds Mova/Skriva + rate cards
    + the admin/internal users. **Log in and change the seeded passwords immediately.**
 4. Add a Caddy site block (mirrors the promos app) and reload Caddy:
@@ -41,6 +45,18 @@ against the **NetSuite sandbox** first, then flip a handful of constants to go t
    ```
    The app has its own per-user login, so Caddy basic-auth is optional here (unlike promos).
    To add an outer gate anyway: `basic_auth { aaron <bcrypt-hash> }` (`caddy hash-password`).
+
+## 1.5 Email delivery for invites + password resets
+Optional, and safe to leave until after the app is up — without it the admin console still
+shows every invite/reset link for you to copy and send by hand.
+
+Full walkthrough (shared `noreply@` mailbox, the Exchange application access policy, the n8n
+workflow import, and how to test it from localhost before deploying):
+**`docs/email_delivery.md`**.
+
+⚠️ Order matters: **import and activate the n8n workflow before** setting
+`N8N_RESET_WEBHOOK_URL`. With the URL set and nothing behind it, every send is a 404 that the
+app swallows by design — so it fails silently.
 
 ## 2. RESTlet in the NetSuite **sandbox**
 1. Sandbox → Setup > Company > Enable Features → SuiteCloud: tick **Token-Based Authentication**
