@@ -41,6 +41,9 @@ IMAP = {"50101": "S-MOVA-1"}
 
 
 def _fresh_customer():
+    # Every module here shares one in-memory DB, so start from empty or the customer insert
+    # collides with whatever an earlier module left behind (UNIQUE on customer.slug).
+    Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     db = SessionLocal()
     cust = Customer(slug="mova", name="Mova", ns_customer_id="10000",
