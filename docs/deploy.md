@@ -39,7 +39,7 @@ against the **NetSuite sandbox** first, then flip a handful of constants to go t
    + the admin/internal users. **Log in and change the seeded passwords immediately.**
 4. Add a Caddy site block (mirrors the promos app) and reload Caddy:
    ```
-   3pl.macgeargroup.com {
+   logistics.macgeargroup.com {
        reverse_proxy threepl:8000
    }
    ```

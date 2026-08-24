@@ -283,7 +283,7 @@ What the app POSTs, so the workflow can be rebuilt from scratch. Source of truth
 | `to` | `sam@mova.com` | |
 | `subject` | `Your access to the Macgear 3PL Portal` | Composed by the app |
 | `body` | *(multi-line plain text)* | Composed by the app. **Plain text, not HTML** |
-| `url` | `https://3pl.macgeargroup.com/reset?token=…` | Single-use |
+| `url` | `https://logistics.macgeargroup.com/reset?token=…` | Single-use |
 | `note` | `Hi Sam, as discussed Tuesday.` | Optional, admin-typed, already inside `body` |
 | `invited_by` | `aaron@macgeargroup.com` | The admin who pressed the button |
 | `reply_to` | `aaron@macgeargroup.com` | Set as the Reply-To header |

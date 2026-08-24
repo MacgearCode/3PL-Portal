@@ -19,8 +19,8 @@ a server; the application never calls Microsoft Graph or Exchange itself.
 >
 > Task 2 is done — nothing needed there.
 
-**Goal:** the 3PL Portal (`3pl.macgeargroup.com`) must email customer invites and password-reset
-links from `noreply@macgeargroup.com`, with no user account in the loop.
+**Goal:** the 3PL Portal (`logistics.macgeargroup.com`) must email customer invites and
+password-reset links from `noreply@macgeargroup.com`, with no user account in the loop.
 
 ---
 

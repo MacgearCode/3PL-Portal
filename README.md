@@ -75,7 +75,7 @@ synced rows to `/admin/ingest` and drains the billing-push queue.
 | `DATABASE_URL` | Postgres URL on the droplet (default: local SQLite) |
 | `APP_SECRET` | session-cookie signing key (set a long random one) |
 | `SYNC_TOKEN` | shared secret for `/admin/ingest` + `/admin/billing/*` (must match the n8n node) |
-| `PUBLIC_BASE_URL` | public origin used to build password-reset links (e.g. `https://3pl.macgeargroup.com`) |
+| `PUBLIC_BASE_URL` | public origin used to build invite + password-reset links (live: `https://logistics.macgeargroup.com`) |
 | `N8N_RESET_WEBHOOK_URL` | n8n webhook that emails the reset link; unset = link logged to console (local dev) |
 | `N8N_WEBHOOK_TOKEN` | secret sent as `X-Sync-Token` to that webhook (blank = reuse `SYNC_TOKEN`) |
 | `RESET_TOKEN_TTL_MIN` | minutes a reset/set-password link stays valid (default 45) |
