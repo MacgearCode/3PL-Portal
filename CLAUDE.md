@@ -249,8 +249,13 @@ default by role, overridable per user (`app_user.allowed_views` JSON; NULL = rol
 role + customer + visible views), and edit per-customer rate cards — a rate change
 writes a NEW effective-dated `RateCard` so past billing runs reprice correctly.
 ### Invites, password reset & account emails (rebuilt 2026-08-12)
-**✅ Delivery verified end-to-end 2026-08-24** — invite and self-service reset both arrive from
-`noreply@macgeargroup.com` via the n8n workflow and Graph app-only. App registration
+**✅ LIVE — verified in production 2026-08-24** on `logistics.macgeargroup.com` (the only host;
+`3pl.macgeargroup.com` never existed, whatever older docs said). Invite and self-service reset
+both arrive from `noreply@macgeargroup.com` via the n8n workflow and Graph app-only. The
+droplet `.env` carries `N8N_RESET_WEBHOOK_URL=http://n8n:5678/webhook/3pl-account-email` (the
+internal address — `SHARED_NETWORK=n8n-docker-caddy_default`), `N8N_WEBHOOK_TOKEN` and
+`INVITE_TOKEN_TTL_MIN=10080`; none of the three were there before, so a rebuilt droplet needs
+them added, not edited. App registration
 `Macgear Portal Mailer` = `dfbb1ab2-7014-490c-91be-950112bd468f` (tenant `9370e6f0-…`); the
 secret lives only in the n8n credential. ⚠️ **Outstanding: the Exchange application access
 policy** (`docs/email_delivery.md` Part 1 step 3) — until it's applied the app registration can
@@ -264,8 +269,10 @@ sends as it without complaint, so it reads as DC affinity on top of the role gap
 name comes from the **mailbox**, never the payload, so there is nothing to change in this
 repo — don't go looking for it in `notify.py`.
 Both are IT tasks; `docs/it_request_portal_mailer.md` is the forwardable ask and its banner
-lists exactly these two.
-Also **not yet on the droplet** — tested from localhost only.
+lists exactly these two. Neither blocks delivery — mail sends today with both outstanding.
+⚠️ **First-send latency is normal, not a fault.** A mailbox with no sending reputation gets
+held for minutes and lands in Junk; the first live test read as a total failure and sent us
+chasing the webhook for half an hour. Triage table in `docs/email_delivery.md` has the row.
 Admins never type anyone's password. Both flows mint a **single-use** token; only
 `sha256(token)` + expiry + purpose are stored (`reset_token_hash`, `reset_expires_at`,
 `reset_purpose`), and both land on the same public `/reset?token=` page, which varies its
