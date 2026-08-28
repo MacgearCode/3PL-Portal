@@ -369,20 +369,11 @@
       {% if period_err %}<div class="flash warn">{{ period_err }}</div>{% endif %}
       {# Same week snapping as the billing page — the report exists to explain a billed week, so
          it must not be able to show a period billing could never produce. #}
-      {# The picker submits itself on change, so there is no separate "go" button to click.
-         There was one, and it read as broken: the input is pre-filled with the week already on
-         screen, so pressing it without first picking a date reloaded the same week and looked
-         like it did nothing. The submit survives inside <noscript> because these pages are
-         meant to work with JS off (the house rule) — without it, JS off would leave the date
-         picker inert and the arrows the only way to move.
-         Clearing the field submits an empty week, which _billing_period() reads as "no week"
-         and answers with the current one. #}
       <form class="period" method="get" action="/c/{{ customer.slug }}/storage_report">
         <a class="btn mini" href="/c/{{ customer.slug }}/storage_report?week={{ prev_week }}"
            title="Previous week">←</a>
-        <label>Week <input type="date" name="week" value="{{ period_start }}"
-                          onchange="this.form.submit()"></label>
-        <noscript><button type="submit">Show</button></noscript>
+        <label>Week <input type="date" name="week" value="{{ period_start }}"></label>
+        <button type="submit">Show</button>
         <a class="btn mini" href="/c/{{ customer.slug }}/storage_report?week={{ next_week }}"
            title="Next week">→</a>
         <span class="note">{{ period_label }}</span>
