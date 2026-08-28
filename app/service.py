@@ -13,7 +13,8 @@ from datetime import date, timedelta
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from .billing import active_rate_card, compute_billing
+from .billing import (active_rate_card, compute_billing, daily_pallets, day_initial,
+                      pallet_str, pallets_of)
 from .models import (BillingLine, BillingRun, ChargeItem, Customer, InboundShipment, Item,
                      ItemFulfilment, ItemFulfilmentLine, ItemReceipt, ItemReceiptLine,
                      Invoice, InvoiceLine, PurchaseOrder, RateCardLine, StockOnHand)
@@ -295,6 +296,41 @@ def soh_synced_at(db: Session, customer_id: int):
             StockOnHand.snapshot_date == latest)) or latest
 
 
+def storage_breakdown(db: Session, customer_id: int, period_start: date,
+                      period_end: date) -> dict | None:
+    """The day-by-day pallet counts behind a storage charge — how its average was reached.
+
+    Storage bills the AVERAGE of the daily pallet totals x the weeks in the period, so the one
+    billed quantity says nothing about where it came from. This is that working, rendered under
+    the storage line on the billing run and on the invoice.
+
+    Re-derived from stock_on_hand rather than parsed back out of billing_line.source_refs: only
+    TODAY's snapshot rows are ever rewritten (netsuite.ingest_stock_on_hand leaves earlier days
+    alone), so for any completed week the source rows are already frozen — and this also works
+    for an invoice raised by hand in NetSuite, which has no billing run behind it at all.
+
+    None when the period holds no snapshots, the same case billing already warns about.
+    """
+    daily = daily_pallets(db, customer_id, period_start, period_end)
+    if not daily:
+        return None
+    avg = sum(daily.values()) / len(daily)
+    span = (period_end - period_start).days + 1
+    weeks = span / 7.0
+    return {
+        "days": [{"date": d, "initial": day_initial(d), "pallets": p,
+                  "text": f"{day_initial(d)}={pallet_str(p)}"}
+                 for d, p in sorted(daily.items())],
+        "avg": round(avg, 2), "weeks": round(weeks, 3),
+        "pallet_weeks": round(avg * weeks, 2),
+        # A sync outage drops a day from the period entirely and the average is then over the
+        # days that exist. That is the right arithmetic, but invisible from the figures alone,
+        # so the counts are carried out for the page to say so rather than quietly averaging
+        # five days into a seven-day charge.
+        "days_expected": span, "days_present": len(daily),
+    }
+
+
 def fulfilments(db: Session, customer_id: int, imap: dict, names: dict | None = None,
                 *, since: date | None = None, q: str | None = None,
                 limit: int | None = None, offset: int = 0) -> dict:
@@ -554,6 +590,148 @@ def latest_activity_date(db: Session, customer_id: int) -> date | None:
     ]
     dates = [d for d in candidates if d]
     return max(dates) if dates else None
+
+
+TREND_WEEKS = 12
+
+
+def storage_report(db: Session, customer_id: int, period_start: date, period_end: date,
+                   imap: dict, names: dict | None = None) -> dict:
+    """The storage report: pallets per day for one week, a 12-week trend, and the movement
+    that explains both. Macgear-internal by default (perms.ROLE_DEFAULT_VIEWS).
+
+    Everything pallet-shaped comes from billing.daily_pallets() / billing.pallets_of(), so the
+    report and the invoice cannot disagree — the whole point of the page is to explain a charge,
+    and a report quoting its own numbers would be worse than no report.
+
+    Three deliberate choices:
+
+    * **Days with no snapshot are gaps, not zeros.** A day the sync never covered is unknown,
+      not empty. Storage averages over the days that exist (`daily_pallets`), so a zero here
+      would both misdraw the chart and contradict the bill.
+    * **One query spans the whole trend.** The 12-week trend and the selected week are sliced
+      out of a single daily_pallets() call rather than 12 calls — the droplet pays a network
+      round trip per query, and this page would otherwise be the most expensive in the app.
+    * **No per-day dollar figure.** Storage is priced on the week's average, so a daily $ would
+      be a number appearing on no invoice. The $ is quoted once, on the tile, as what the week
+      bills.
+    """
+    names = names or {}
+    rate = storage_rate(db, customer_id)
+    span_days = (period_end - period_start).days + 1
+    weeks = span_days / 7.0
+
+    # --- pallets: one query for the trend window, sliced for both charts ------
+    trend_start = period_start - timedelta(weeks=TREND_WEEKS - 1)
+    all_days = daily_pallets(db, customer_id, trend_start, period_end)
+    present = {d: p for d, p in all_days.items() if period_start <= d <= period_end}
+    avg_pallets = round(sum(present.values()) / len(present), 2) if present else 0.0
+    pallet_weeks = round(avg_pallets * weeks, 2)
+
+    # --- movement: receipts in / fulfilments out, by trandate ----------------
+    received = _units_by_day(db, ItemReceipt, _RECEIPT_LINES, "lines",
+                             customer_id, period_start, period_end)
+    dispatched = _units_by_day(db, ItemFulfilment, _FULFILMENT_LINES, "lines",
+                               customer_id, period_start, period_end)
+
+    # --- per-item rows for the selected week (units + the SKU split) ---------
+    rows = db.scalars(
+        select(StockOnHand).where(
+            StockOnHand.customer_id == customer_id,
+            StockOnHand.snapshot_date >= period_start,
+            StockOnHand.snapshot_date <= period_end)).all()
+    units_by_day: dict[date, float] = {}
+    skus_by_day: dict[date, int] = {}
+    by_item: dict[str, dict] = {}
+    for r in rows:
+        qty = float(r.qty_on_hand or 0)
+        units_by_day[r.snapshot_date] = units_by_day.get(r.snapshot_date, 0.0) + qty
+        if qty > 0:
+            skus_by_day[r.snapshot_date] = skus_by_day.get(r.snapshot_date, 0) + 1
+        it = by_item.setdefault(r.ns_item_id, {
+            "sku": imap.get(r.ns_item_id, r.ns_item_id), "name": names.get(r.ns_item_id, ""),
+            "units_per_pallet": r.units_per_pallet, "pallets": {}, "units": {}})
+        # units_per_pallet is snapshotted per row; any non-NULL one describes the SKU.
+        if r.units_per_pallet:
+            it["units_per_pallet"] = r.units_per_pallet
+        it["pallets"][r.snapshot_date] = it["pallets"].get(r.snapshot_date, 0.0) + pallets_of(r)
+        it["units"][r.snapshot_date] = it["units"].get(r.snapshot_date, 0.0) + qty
+
+    # --- the day series: one entry per CALENDAR day, snapshot or not ---------
+    days = []
+    for i in range(span_days):
+        d = period_start + timedelta(days=i)
+        days.append({"date": d, "initial": day_initial(d), "label": d.strftime("%a"),
+                     "pallets": present.get(d), "units": units_by_day.get(d),
+                     "skus": skus_by_day.get(d, 0) if d in present else None,
+                     "received": received.get(d, 0.0), "dispatched": dispatched.get(d, 0.0),
+                     "missing": d not in present})
+    seen_days = [x for x in days if not x["missing"]]
+    peak = max(seen_days, key=lambda x: x["pallets"], default=None)
+    low = min(seen_days, key=lambda x: x["pallets"], default=None)
+
+    # --- per-SKU table, biggest holder first --------------------------------
+    day_dates = [x["date"] for x in days]
+    skus = []
+    for it in by_item.values():
+        per_day = [it["pallets"].get(d) for d in day_dates]
+        seen = [v for v in per_day if v is not None]
+        latest = max(it["units"]) if it["units"] else None
+        skus.append({
+            "sku": it["sku"], "name": it["name"], "units_per_pallet": it["units_per_pallet"],
+            "per_day": per_day, "peak": max(seen) if seen else 0.0,
+            "avg": round(sum(seen) / len(seen), 2) if seen else 0.0,
+            "units_latest": it["units"].get(latest, 0.0) if latest else 0.0,
+            # A SKU with custitem_pallet_quantity NULL bills 0 pallets however much stock it
+            # holds (three real Mova SKUs). It stays in the table as an explicit zero row
+            # precisely so that is visible instead of being quietly absent.
+            "no_pallet_qty": not it["units_per_pallet"],
+        })
+    skus.sort(key=lambda x: (-x["peak"], x["sku"]))
+
+    # --- 12-week trend of the weekly average -------------------------------
+    trend = []
+    for w in range(TREND_WEEKS):
+        ws = trend_start + timedelta(weeks=w)
+        we = ws + timedelta(days=6)
+        vals = [p for d, p in all_days.items() if ws <= d <= we]
+        trend.append({"week_start": ws, "week_end": we, "label": ws.strftime("%d %b"),
+                      "avg_pallets": round(sum(vals) / len(vals), 2) if vals else 0.0,
+                      "days_present": len(vals), "current": ws == period_start})
+
+    return {
+        "days": days, "skus": skus, "trend": trend,
+        # Bar heights are inline percentages of the series max (the house chart pattern), so
+        # each series carries its own. `or 1` keeps an all-zero series off a divide by zero.
+        "pallets_max": max((x["pallets"] or 0 for x in days), default=0) or 1,
+        "units_max": max((x["units"] or 0 for x in days), default=0) or 1,
+        "move_max": max((max(x["received"], x["dispatched"]) for x in days), default=0) or 1,
+        "trend_max": max((t["avg_pallets"] for t in trend), default=0) or 1,
+        "avg_pallets": avg_pallets, "pallet_weeks": pallet_weeks, "rate": rate,
+        "storage_cost": round(pallet_weeks * rate, 2),
+        "peak": peak, "low": low, "weeks": round(weeks, 3),
+        "days_present": len(present), "days_expected": span_days,
+        "units_received": round(sum(received.values()), 2),
+        "units_dispatched": round(sum(dispatched.values()), 2),
+    }
+
+
+def _units_by_day(db: Session, model, loader, lines_attr: str, customer_id: int,
+                  period_start: date, period_end: date) -> dict[date, float]:
+    """Line units per trandate for a receipt/fulfilment model — the movement series.
+
+    Same positive-only guard as billing.py: the cache already stores positives, but a negative
+    line would net off a day's movement and make the chart understate a return.
+    """
+    docs = db.scalars(
+        select(model).where(model.customer_id == customer_id,
+                            model.trandate >= period_start,
+                            model.trandate <= period_end).options(loader)).all()
+    out: dict[date, float] = {}
+    for doc in docs:
+        qty = sum(max(0.0, float(l.qty)) for l in getattr(doc, lines_attr))
+        out[doc.trandate] = out.get(doc.trandate, 0.0) + qty
+    return out
 
 
 def week_bounds(d: date) -> tuple[date, date]:

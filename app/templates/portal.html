@@ -63,6 +63,26 @@
 </div>
 {% endif %}
 {% endmacro %}
+
+{# Day-by-day pallet counts under a storage charge line. Storage is the one charge whose
+   quantity is an AVERAGE (avg daily pallets x weeks) rather than a count of documents, so the
+   billed figure on its own can't be explained to a customer who queries it. Rendered on the
+   billing run, the live preview and the retained invoice, all from the same arithmetic that
+   produced the charge (service.storage_breakdown -> billing.daily_pallets). #}
+{% macro palletdays(sd) %}
+{%- if sd %}
+<div class="pqdays">
+  <span class="pqlab" title="Pallet quantity on hand, per day">PQ</span>
+  {% for x in sd.days %}<span class="pqd" title="{{ x.date|d }}">{{ x.initial }}=<b>{{ x.pallets|qty }}</b></span>{% endfor %}
+  <span class="pqsum">avg <b>{{ sd.avg|money }}</b>/day{% if sd.weeks != 1.0 %} × {{ sd.weeks }} wk{% endif %} =
+    <b>{{ sd.pallet_weeks|money }}</b> pallet-weeks</span>
+  {% if sd.days_present < sd.days_expected %}
+  <span class="pqwarn">{{ sd.days_present }} of {{ sd.days_expected }} days snapshotted — the
+    average is over the days that exist, not the whole period</span>
+  {% endif %}
+</div>
+{%- endif %}
+{% endmacro %}
 {% block body %}
 <div class="app">
   <aside class="side">
@@ -147,12 +167,12 @@
       <div class="grid2">
         {# One card, three server-rendered series; chartTab() swaps which carries .is-on.
            No chart library — bar heights are baked in as inline percentages. #}
-        <div class="card">
+        <div class="card" data-chart="overview" data-default="billing">
           <header><h3>Weekly activity</h3>
             <div class="segbtns" role="tablist" aria-label="Chart series">
-              <button type="button" role="tab" data-series="received" aria-selected="false" onclick="chartTab('received')">Received</button>
-              <button type="button" role="tab" data-series="incoming" aria-selected="false" onclick="chartTab('incoming')">Incoming</button>
-              <button type="button" role="tab" data-series="billing" aria-selected="true" onclick="chartTab('billing')">Billing</button>
+              <button type="button" role="tab" data-series="received" aria-selected="false" onclick="chartTab('received', this)">Received</button>
+              <button type="button" role="tab" data-series="incoming" aria-selected="false" onclick="chartTab('incoming', this)">Incoming</button>
+              <button type="button" role="tab" data-series="billing" aria-selected="true" onclick="chartTab('billing', this)">Billing</button>
             </div>
           </header>
           <div class="chart">
@@ -322,7 +342,9 @@
       <div class="card"><header><h3>What was charged</h3><span class="hint">3PL service charge lines</span></header>
         <div class="tablewrap"><table>
           <thead><tr><th>Charge</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead>
-          <tbody>{% for l in lines %}<tr><td class="prim">{{ l.description }}</td>
+          <tbody>{% for l in lines %}<tr>
+            <td class="prim">{{ l.description }}
+              {% if l.charge_type == 'storage' %}{{ palletdays(storage_days) }}{% endif %}</td>
             <td class="r num">{{ l.qty|qty }}</td><td class="r num">{{ '$' ~ l.rate|money if l.rate is not none else '—' }}</td>
             <td class="r num"><b>${{ l.amount|money }}</b></td></tr>
           {% else %}<tr><td class="empty" colspan="4">No line detail on this invoice.</td></tr>{% endfor %}</tbody>
@@ -340,6 +362,176 @@
           {% if rows %}<tfoot><tr><td colspan="3">{{ total|qty }} invoices</td><td class="r">${{ qty_total|money }}</td><td colspan="2"></td></tr></tfoot>{% endif %}
         </table></div>
         {{ loadmore('tbl-inv') }}
+      </div>
+
+    {% elif view == "storage_report" %}
+      {% set d = data %}
+      {% if period_err %}<div class="flash warn">{{ period_err }}</div>{% endif %}
+      {# Same week snapping as the billing page — the report exists to explain a billed week, so
+         it must not be able to show a period billing could never produce. #}
+      <form class="period" method="get" action="/c/{{ customer.slug }}/storage_report">
+        <a class="btn mini" href="/c/{{ customer.slug }}/storage_report?week={{ prev_week }}"
+           title="Previous week">←</a>
+        <label>Week <input type="date" name="week" value="{{ period_start }}"></label>
+        <button type="submit">Show</button>
+        <a class="btn mini" href="/c/{{ customer.slug }}/storage_report?week={{ next_week }}"
+           title="Next week">→</a>
+        <span class="note">{{ period_label }}</span>
+      </form>
+
+      {% if d.days_present %}
+      {# The average is the figure storage actually bills, so it leads. Peak and low are what
+         say whether the average is a fair description of the week or is hiding a spike. #}
+      <div class="kpis">
+        <div class="kpi k-pallet"><div class="rail"></div><div class="lab">Avg pallets / day</div>
+          <div class="val num">{{ d.avg_pallets|money }}</div>
+          <div class="meta">over {{ d.days_present }} snapshot day{{ 's' if d.days_present != 1 }}
+            {%- if d.days_present < d.days_expected %} of {{ d.days_expected }}{% endif %}</div></div>
+        <div class="kpi k-stock"><div class="rail"></div><div class="lab">Peak day</div>
+          <div class="val num">{{ d.peak.pallets|qty }}</div>
+          <div class="meta">{{ d.peak.label }} {{ d.peak.date|dshort }} · low {{ d.low.pallets|qty }}
+            ({{ d.low.label }})</div></div>
+        <div class="kpi k-order"><div class="rail"></div><div class="lab">Moved this week</div>
+          <div class="val num">{{ d.units_received|qty }}<span class="sub2">in</span></div>
+          <div class="meta">{{ d.units_dispatched|qty }} units dispatched out</div></div>
+        <div class="kpi k-bill"><div class="rail"></div><div class="lab">Storage billed</div>
+          <div class="val num">${{ d.storage_cost|money0 }}</div>
+          <div class="meta">{{ d.pallet_weeks|money }} pallet-weeks × ${{ d.rate|money }}</div></div>
+      </div>
+      {% else %}
+      <div class="flash warn">No stock-on-hand snapshot exists inside this week, so there is
+        nothing to report and storage would bill $0 for it. Weeks before the sync started have
+        no snapshot at all — try a later week.</div>
+      {% endif %}
+
+      {# Trend first: a single week's pallet figure means little without knowing whether the
+         warehouse is filling or emptying. Weeks the sync never covered are drawn as gaps. #}
+      <div class="card" data-chart="storage-trend" data-default="trend">
+        <header><h3>{{ d.trend|length }}-week trend</h3>
+          <span class="hint">average pallets per day, per week — ● is the selected week</span></header>
+        <div class="chart">
+          <div class="bars is-on" data-series="trend" role="img"
+               aria-label="Average pallets per day for each of the last {{ d.trend|length }} weeks">
+            {% for t in d.trend %}
+            <div class="bar {{ 'cur' if t.current }} {{ 'zero' if not t.days_present }}"
+                 title="{{ t.week_start|dshort }} – {{ t.week_end|d }}{% if t.days_present %} · {{ t.days_present }} snapshot day(s){% else %} · never synced{% endif %}">
+              <span class="vl">{% if t.days_present %}{{ t.avg_pallets|qty }}{% else %}—{% endif %}</span>
+              <div class="fill" style="height:{{ (t.avg_pallets / d.trend_max * 100)|round }}%"></div>
+              <span class="lb">{{ t.label }}</span>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+
+      {# Three series over the selected week. Pallets is what bills; units shows a part-pallet
+         SKU filling up without the pallet count moving; movement answers "why did Wednesday
+         jump". chartTab() is scoped to this card (see the script at the foot). #}
+      <div class="card" data-chart="storage-week" data-default="pallets">
+        <header><h3>{{ period_label }}</h3>
+          <div class="segbtns" role="tablist" aria-label="Chart series">
+            <button type="button" role="tab" data-series="pallets" aria-selected="true"
+                    onclick="chartTab('pallets', this)">Pallets</button>
+            <button type="button" role="tab" data-series="units" aria-selected="false"
+                    onclick="chartTab('units', this)">Units</button>
+            <button type="button" role="tab" data-series="movement" aria-selected="false"
+                    onclick="chartTab('movement', this)">Movement</button>
+          </div>
+        </header>
+        <div class="chart">
+          <div class="bars is-on" data-series="pallets" role="tabpanel" aria-label="Pallets held per day">
+            {% for x in d.days %}
+            <div class="bar {{ 'gap' if x.missing }}" title="{{ x.date|d }}{% if x.missing %} · no snapshot{% endif %}">
+              <span class="vl">{% if x.missing %}—{% else %}{{ x.pallets|qty }}{% endif %}</span>
+              <div class="fill" style="height:{{ ((x.pallets or 0) / d.pallets_max * 100)|round }}%"></div>
+              <span class="lb">{{ x.initial }}</span>
+            </div>
+            {% endfor %}
+          </div>
+          <div class="bars" data-series="units" role="tabpanel" aria-label="Units on hand per day">
+            {% for x in d.days %}
+            <div class="bar {{ 'gap' if x.missing }}" title="{{ x.date|d }}{% if x.missing %} · no snapshot{% endif %}">
+              <span class="vl">{% if x.missing %}—{% else %}{{ x.units|qty }}{% endif %}</span>
+              <div class="fill" style="height:{{ ((x.units or 0) / d.units_max * 100)|round }}%"></div>
+              <span class="lb">{{ x.initial }}</span>
+            </div>
+            {% endfor %}
+          </div>
+          {# Movement is a real 0 on a quiet day, not a gap — receipts and dispatches are
+             counted from documents, which exist or don't, independently of the SOH sync. #}
+          <div class="bars" data-series="movement" role="tabpanel" aria-label="Units received and dispatched per day">
+            {% for x in d.days %}
+            <div class="bar twin" title="{{ x.date|d }} · {{ x.received|qty }} in, {{ x.dispatched|qty }} out">
+              <span class="vl">{{ (x.received - x.dispatched)|qty if x.received or x.dispatched else 0 }}</span>
+              <div class="pair">
+                <div class="fill fin" style="height:{{ (x.received / d.move_max * 100)|round }}%"></div>
+                <div class="fill fout" style="height:{{ (x.dispatched / d.move_max * 100)|round }}%"></div>
+              </div>
+              <span class="lb">{{ x.initial }}</span>
+            </div>
+            {% endfor %}
+          </div>
+          <div class="chartnote is-on" data-series="pallets">Pallets held per day — their average is
+            what storage bills. A dashed bar is a day the sync did not cover.</div>
+          <div class="chartnote" data-series="units">Units on hand per day. Units can move without
+            pallets moving, and vice versa — pallets are ceil(units / units per pallet) per SKU.</div>
+          <div class="chartnote" data-series="movement">Units received (solid) against units
+            dispatched (outlined) per day, by document date. The number is the net.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <header><h3>Day by day</h3><span class="hint">the working behind the average</span></header>
+        {{ tabletools('tbl-pqday', 'pallets-per-day-' ~ period_start) }}
+        <div class="tablewrap"><table id="tbl-pqday">
+          <thead><tr><th>Day</th><th>Date</th><th class="r">Pallets</th><th class="r">Units on hand</th>
+            <th class="r">SKUs</th><th class="r">Received</th><th class="r">Dispatched</th></tr></thead>
+          <tbody>{% for x in d.days %}
+          <tr class="{{ 'rowgap' if x.missing }}">
+            <td class="prim">{{ x.label }}{% if x.date == d.peak.date %} <span class="chip c-info">peak</span>{% endif %}</td>
+            <td>{{ x.date|d }}</td>
+            {% if x.missing %}
+            <td class="r sub2" colspan="3">no snapshot — the sync did not cover this day</td>
+            {% else %}
+            <td class="r num"><b>{{ x.pallets|qty }}</b></td>
+            <td class="r num">{{ x.units|qty }}</td>
+            <td class="r num">{{ x.skus }}</td>
+            {% endif %}
+            <td class="r num">{{ x.received|qty if x.received else '—' }}</td>
+            <td class="r num">{{ x.dispatched|qty if x.dispatched else '—' }}</td>
+          </tr>{% endfor %}</tbody>
+          <tfoot><tr><td colspan="2">Average over {{ d.days_present }} snapshot day{{ 's' if d.days_present != 1 }}</td>
+            <td class="r">{{ d.avg_pallets|money }}</td><td colspan="2"></td>
+            <td class="r">{{ d.units_received|qty }}</td><td class="r">{{ d.units_dispatched|qty }}</td></tr></tfoot>
+        </table></div>
+      </div>
+
+      {# Which SKU holds the pallets. Biggest holder first, and a SKU with no pallet quantity in
+         NetSuite is kept as an explicit zero row — it bills nothing however much stock it holds,
+         and being absent from the table is how that stays unnoticed. #}
+      <div class="card">
+        <header><h3>By SKU</h3><span class="hint">pallets per day, largest holder first</span></header>
+        {{ tabletools('tbl-pqsku', 'pallets-per-sku-' ~ period_start) }}
+        <div class="tablewrap"><table id="tbl-pqsku">
+          <thead><tr><th>SKU</th><th>Description</th><th class="r">Units / pallet</th>
+            {% for x in d.days %}<th class="r">{{ x.initial }}</th>{% endfor %}
+            <th class="r">Avg</th><th class="r">Peak</th></tr></thead>
+          <tbody>{% for r in d.skus %}
+          <tr>
+            <td class="prim">{{ r.sku }}
+              {% if r.no_pallet_qty %}<span class="chip c-crit">no pallet qty</span>{% endif %}</td>
+            <td class="sub2">{{ r.name }}</td>
+            <td class="r num">{{ r.units_per_pallet if r.units_per_pallet else '—' }}</td>
+            {% for v in r.per_day %}<td class="r num">{{ '—' if v is none else v|qty }}</td>{% endfor %}
+            <td class="r num">{{ r.avg|money }}</td>
+            <td class="r num"><b>{{ r.peak|qty }}</b></td>
+          </tr>
+          {% else %}<tr><td class="empty" colspan="{{ 5 + d.days|length }}">No stock held in this week.</td></tr>{% endfor %}</tbody>
+          {% if d.skus %}<tfoot><tr><td colspan="3">{{ d.skus|length }} SKU{{ 's' if d.skus|length != 1 }}</td>
+            {% for x in d.days %}<td class="r">{{ '—' if x.missing else x.pallets|qty }}</td>{% endfor %}
+            <td class="r">{{ d.avg_pallets|money }}</td>
+            <td class="r">{{ d.peak.pallets|qty if d.peak else '—' }}</td></tr></tfoot>{% endif %}
+        </table></div>
       </div>
 
     {% elif view == "rate_card" %}
@@ -413,7 +605,8 @@
             <td class="prim">{{ l.description or l.charge_type }}
               {% if l.origin == 'manual' %}<span class="chip c-info">added</span>
               {% elif l.origin == 'edited' %}<span class="chip c-warn">edited</span>
-              {% elif l.origin == 'removed' %}<span class="chip c-neutral">removed</span>{% endif %}</td>
+              {% elif l.origin == 'removed' %}<span class="chip c-neutral">removed</span>{% endif %}
+              {% if l.charge_type == 'storage' %}{{ palletdays(storage_days) }}{% endif %}</td>
             {% if not l.billable %}
             <td class="r num">—</td><td class="r num">—</td><td class="r num">$0.00</td>
             {% elif draft_run %}
@@ -501,7 +694,10 @@
       <div class="billgrid">
         <div class="card"><div class="tablewrap"><table>
           <thead><tr><th>Charge</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead>
-          <tbody>{% for l in result.lines %}<tr><td class="prim">{{ l.label }}</td><td class="r num">{{ l.qty|qty }}</td>
+          <tbody>{% for l in result.lines %}<tr>
+            <td class="prim">{{ l.label }}
+              {% if l.charge_type == 'storage' %}{{ palletdays(storage_days) }}{% endif %}</td>
+            <td class="r num">{{ l.qty|qty }}</td>
             <td class="r num">${{ l.rate|money }}<span class="sub2">/{{ l.basis|replace('per_','')|replace('_',' ') }}</span></td>
             <td class="r num"><b>${{ l.amount|money }}</b></td></tr>
           {% else %}<tr><td class="empty" colspan="4">No billable activity in this period.</td></tr>{% endfor %}</tbody>
@@ -622,22 +818,36 @@
 <script>
 function toggleNav(){document.querySelector('.app').classList.toggle('navopen')}
 
-// Overview chart: all three series are already in the DOM, so switching is just a class
-// swap. The choice is remembered the same way the theme is (base.html).
-function chartTab(key){
-  document.querySelectorAll('.chart > [data-series], .chartnote').forEach(function(el){
-    el.classList.toggle('is-on', el.dataset.series === key);
+// Series charts: every series is already in the DOM, so switching is just a class swap. The
+// choice is remembered per chart, the same way the theme is (base.html).
+//
+// SCOPED TO THE CARD. This used to query the whole document and remember one global key, which
+// was fine while the overview was the only chart. The storage report has two on one page: an
+// unscoped switch moved both at once, and a key remembered from one card ('billing') matched no
+// series in the other and left it blank. Every chart card carries data-chart (its storage key)
+// and data-default (the series to show when nothing is remembered).
+function chartTab(key, el){
+  var card = (el && el.closest('.card')) || document;
+  card.querySelectorAll('.chart > [data-series], .chartnote').forEach(function(node){
+    node.classList.toggle('is-on', node.dataset.series === key);
   });
-  document.querySelectorAll('.segbtns button').forEach(function(b){
+  card.querySelectorAll('.segbtns button').forEach(function(b){
     b.setAttribute('aria-selected', b.dataset.series === key ? 'true' : 'false');
   });
-  try{ localStorage.setItem('chartSeries', key); }catch(e){}
+  var id = card.getAttribute && card.getAttribute('data-chart');
+  if(id){ try{ localStorage.setItem('chartSeries:' + id, key); }catch(e){} }
 }
 (function(){
-  if(!document.querySelector('.segbtns')) return;   // not the overview
-  var saved;
-  try{ saved = localStorage.getItem('chartSeries'); }catch(e){}
-  chartTab(saved || 'billing');
+  document.querySelectorAll('.card[data-chart]').forEach(function(card){
+    var saved;
+    try{ saved = localStorage.getItem('chartSeries:' + card.getAttribute('data-chart')); }catch(e){}
+    // Fall back to the card's declared default if the remembered series no longer exists —
+    // otherwise a renamed series leaves the chart empty with no way to get it back.
+    var btn = (saved && card.querySelector('.segbtns button[data-series="' + saved + '"]'))
+           || card.querySelector('.segbtns button[data-series="' + card.getAttribute('data-default') + '"]')
+           || card.querySelector('.segbtns button');
+    if(btn){ chartTab(btn.dataset.series, btn); }
+  });
 })();
 
 // Load more: fetch the next page of rows and append, so you keep your scroll position.

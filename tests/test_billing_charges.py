@@ -34,7 +34,7 @@ os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.db import Base, SessionLocal, engine  # noqa: E402
-from app import netsuite  # noqa: E402
+from app import netsuite, service  # noqa: E402
 from app.billing import compute_billing  # noqa: E402
 from app.models import Customer, RateCard, RateCardLine, StockOnHand  # noqa: E402
 from app.seed import MOVA_RATES  # noqa: E402
@@ -206,6 +206,67 @@ def test_storage_ignores_items_with_no_units_per_pallet():
     _snapshot(db, cust, date(2026, 7, 22), {"50001": (1200, 12), "52856": (3000, None)})
     res = compute_billing(db, cust, *WEEK_A)
     assert _line(res, "storage").qty == 100.0, "only the SKU with a pallet quantity is billed"
+    db.close()
+
+
+def test_storage_breakdown_explains_the_billed_average():
+    """The day-by-day working shown under the storage line on the run and the invoice.
+
+    Storage is the only charge whose quantity is an average rather than a count of documents,
+    so "1,201.71 pallet-weeks" cannot be traced back from the invoice on its own. The
+    breakdown must reconcile EXACTLY to the billed quantity — a second implementation that
+    drifted from billing.py would be worse than showing nothing.
+    """
+    db, cust = _fresh_customer()
+    per_day = {20: 1103, 21: 1259, 22: 1305, 23: 1205, 24: 1180, 25: 1180, 26: 1180}
+    for d, pallets in per_day.items():
+        _snapshot(db, cust, date(2026, 7, d), {"50001": (pallets * 12, 12)})
+
+    bd = service.storage_breakdown(db, cust.id, *WEEK_A)
+    assert [x["text"] for x in bd["days"]] == [
+        "M=1103", "T=1259", "W=1305", "Th=1205", "F=1180", "Sa=1180", "Su=1180"], bd["days"]
+    assert bd["days_present"] == bd["days_expected"] == 7
+    assert bd["weeks"] == 1.0
+    assert bd["pallet_weeks"] == _line(compute_billing(db, cust, *WEEK_A), "storage").qty,         "the breakdown must reconcile to the quantity actually billed"
+    db.close()
+
+
+def test_source_refs_record_the_per_day_pallet_counts():
+    """The frozen audit trail on the billing line, not just which dates contributed.
+
+    source_refs used to hold a bare list of ISO dates, which said a snapshot existed on each
+    day and nothing about what it read — useless for answering "how did you get 106.5?".
+    """
+    db, cust = _fresh_customer()
+    _snapshot(db, cust, date(2026, 7, 20), {"50001": (715, 12), "50002": (700, 12)})
+    _snapshot(db, cust, date(2026, 7, 21), {"50001": (715, 12), "50002": (400, 12)})
+    refs = _line(compute_billing(db, cust, *WEEK_A), "storage").source_refs
+    assert refs[1:] == ["2026-07-20 M=119", "2026-07-21 T=94"], refs
+    assert "avg 106.5 pallets/day over 2 snapshot day(s)" in refs[0]
+    db.close()
+
+
+def test_storage_breakdown_flags_a_week_the_sync_only_partly_covered():
+    """A sync outage drops a day entirely, and the average is then over the days that exist.
+
+    That is the right arithmetic, but from the figures alone it is indistinguishable from a
+    full week — so the counts are carried out for the page to say so.
+    """
+    db, cust = _fresh_customer()
+    for d in (20, 21, 22, 23, 24):                      # Fri-Sun never synced
+        _snapshot(db, cust, date(2026, 7, d), {"50001": (1200, 12)})
+    bd = service.storage_breakdown(db, cust.id, *WEEK_A)
+    assert (bd["days_present"], bd["days_expected"]) == (5, 7)
+    assert bd["avg"] == 100.0, "averaged over the 5 days that exist, not diluted by 7"
+    assert bd["pallet_weeks"] == _line(compute_billing(db, cust, *WEEK_A), "storage").qty
+    db.close()
+
+
+def test_storage_breakdown_is_none_when_the_period_has_no_snapshot():
+    """Same case billing already warns about — the page must show nothing, not a zero week."""
+    db, cust = _fresh_customer()
+    _snapshot(db, cust, date(2026, 7, 27), {"50001": (6369, 12)})
+    assert service.storage_breakdown(db, cust.id, *WEEK_A) is None
     db.close()
 
 

@@ -78,6 +78,20 @@ onboarding a customer needs no n8n edit.
 > **Corollary (2026-08-01):** if the period contains *no* snapshot at all — any week before the
 > sync started — storage computes to **$0** with nothing to show for it. `billing.py` now raises a
 > warning in that case rather than letting the charge vanish.
+> **Corollary (2026-08-28):** an average is not self-explaining. Every other charge is a count of
+> documents you can go and look at; storage is one number nobody can reconstruct from the invoice.
+> The daily totals are therefore shown as the line's working — `PQ M=1103 T=1259 W=1305 …`, then
+> `avg … /day × … wk = … pallet-weeks` — on the billing preview, the saved run and the retained
+> invoice, and written into `billing_line.source_refs` per day (it previously held only the list of
+> dates that contributed, which answered nothing). `billing.daily_pallets()` is the one
+> implementation behind both the charge and the working; `service.storage_breakdown()` shapes it for
+> the page and reports `days_present` / `days_expected`, so a week the sync only partly covered says
+> so on the line instead of looking like a full one.
+> **The report (2026-08-28):** `/c/<slug>/storage_report` is the same data as a page — 12-week
+> trend of the weekly average, daily pallets/units/movement for one week, and a per-SKU split.
+> Macgear-internal by default, grantable to a customer user. It reconciles to the invoice by
+> construction (same `daily_pallets()`), and a test asserts it: a report quoting numbers of its
+> own would be used to defend a figure it doesn't compute.
 
 > **Container unload is dated by the receipt, not the shipment (2026-08-01).** The obvious source —
 > `inbound_shipment.received_date` — is unusable. In production `actualdeliverydate` is NULL on all

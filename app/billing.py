@@ -78,6 +78,60 @@ def _names(items: list, limit: int = 10) -> str:
     return head if len(items) <= limit else f"{head} (+{len(items) - limit} more)"
 
 
+_DAY_INITIAL = ("M", "T", "W", "Th", "F", "Sa", "Su")
+
+
+def day_initial(d: date) -> str:
+    """Monday-first weekday initial for the storage breakdown. Tue/Thu and Sat/Sun are spelled
+    to two letters (T/Th, Sa/Su) so a day-by-day line can't be misread as the wrong day."""
+    return _DAY_INITIAL[d.weekday()]
+
+
+def pallet_str(v: float) -> str:
+    """A pallet count without a pointless '.0'. Pallets are integral in practice (ceil per
+    item), but a row written before the `pallets` column existed can compute fractional."""
+    return str(int(v)) if float(v).is_integer() else f"{float(v):.2f}"
+
+
+def pallets_of(s: StockOnHand) -> float:
+    """Pallets for ONE stock_on_hand row — the whole pallet rule, in one place.
+
+    `pallets` is used as snapshotted, so a later change to custitem_pallet_quantity in NetSuite
+    cannot move a historic charge; the ceil fallback only fires on rows written before that
+    column existed. A row with no units_per_pallet at all contributes **0**, which is a real
+    production case (three Mova SKUs) and the reason the storage report shows those SKUs as
+    explicit zero rows instead of leaving them out.
+    """
+    if s.pallets is not None:
+        return float(s.pallets)
+    if s.units_per_pallet:
+        return float(math.ceil(float(s.qty_on_hand) / s.units_per_pallet))
+    return 0.0
+
+
+def daily_pallets(db: Session, customer_id: int, period_start: date,
+                  period_end: date) -> dict[date, float]:
+    """Total pallets on hand per snapshot day in the period — the figures storage averages.
+
+    One entry per distinct snapshot_date, summed over every item. Days the sync never covered
+    are simply absent (not zero): storage averages over the days that exist, and a zero would
+    drag the average down as though the warehouse had emptied.
+
+    Shared with service.storage_breakdown() and service.storage_report() so the working shown
+    on the invoice and the report charts is the arithmetic that billed it, not a second
+    implementation of it.
+    """
+    snaps = db.scalars(
+        select(StockOnHand).where(
+            StockOnHand.customer_id == customer_id,
+            StockOnHand.snapshot_date >= period_start,
+            StockOnHand.snapshot_date <= period_end)).all()
+    out: dict[date, float] = {}
+    for s in snaps:
+        out[s.snapshot_date] = out.get(s.snapshot_date, 0.0) + pallets_of(s)
+    return out
+
+
 def compute_billing(db: Session, customer: Customer, period_start: date, period_end: date,
                     warn: bool = True) -> BillingResult:
     """Compute the period's charges. `warn=False` skips the under-billing checks and their
@@ -163,33 +217,24 @@ def compute_billing(db: Session, customer: Customer, period_start: date, period_
                 f"receipt, so they are not billable in any period: {_names(stranded)}.")
 
     # --- storage: average daily pallets x weeks in period ---------------------
-    # SOH is now snapshotted often (every ~15 min, collapsed to one row per item per
-    # day by the unique key), so we can't just sum every snapshot — that would bill
-    # one pallet-week per *day* (~7x). Instead: total pallets per distinct day, average
-    # those daily totals, then scale by the number of weeks the period spans. With a
-    # single snapshot in the period this degrades to "that reading held all period",
-    # matching the old weekly-snapshot behaviour. (docs/data_model.md: avg daily pallets.)
-    snaps = db.scalars(
-        select(StockOnHand).where(
-            StockOnHand.customer_id == customer.id,
-            StockOnHand.snapshot_date >= period_start,
-            StockOnHand.snapshot_date <= period_end)).all()
-    daily_pallets: dict[date, float] = {}
-    for s in snaps:
-        if s.pallets is not None:
-            pallets = float(s.pallets)
-        elif s.units_per_pallet:
-            pallets = math.ceil(float(s.qty_on_hand) / s.units_per_pallet)
-        else:
-            pallets = 0.0
-        daily_pallets[s.snapshot_date] = daily_pallets.get(s.snapshot_date, 0.0) + pallets
-    if daily_pallets:
-        avg_daily = sum(daily_pallets.values()) / len(daily_pallets)
+    # Per-day totals from daily_pallets(), averaged, then scaled by the weeks the period
+    # spans. SOH is a near-live snapshot refreshed every ~15 min (collapsed to one row per
+    # item per day by the unique key), so summing every snapshot would bill one pallet-week
+    # per *day* (~7x). With a single snapshot in the period this degrades to "that reading
+    # held all period", matching the old weekly-snapshot behaviour.
+    # (docs/data_model.md: avg daily pallets.)
+    daily = daily_pallets(db, customer.id, period_start, period_end)
+    if daily:
+        avg_daily = sum(daily.values()) / len(daily)
         weeks = ((period_end - period_start).days + 1) / 7.0
         pallet_weeks = round(avg_daily * weeks, 2)
-        snap_refs = [f"avg {round(avg_daily, 2)} pallets/day over {len(daily_pallets)} "
+        # The per-day figures, not just the dates that contributed. source_refs is the frozen
+        # record of how the average was reached, and the average on its own is exactly the
+        # number a customer queries — "1,218 pallet-weeks" explains nothing by itself.
+        snap_refs = [f"avg {round(avg_daily, 2)} pallets/day over {len(daily)} "
                      f"snapshot day(s) x {round(weeks, 3)} week(s)",
-                     *sorted(d.isoformat() for d in daily_pallets)]
+                     *(f"{d.isoformat()} {day_initial(d)}={pallet_str(p)}"
+                       for d, p in sorted(daily.items()))]
         add("storage", pallet_weeks, snap_refs)
     elif warn:
         # No snapshot inside the period — storage silently computes to nothing. True for any week

@@ -179,9 +179,47 @@ received in NetSuite that no receipt points at, and **no SOH snapshot inside the
 otherwise drops the storage charge to nothing with no trace). A charge computing to zero must be
 visible — that's the whole lesson of the container bug below.
 
+**Storage shows its working** (added 2026-08-28). Storage is the only charge whose quantity is an
+*average* (avg daily pallets x weeks) rather than a count of documents, so the billed figure can't
+be traced back from the invoice on its own. `service.storage_breakdown()` renders the day-by-day
+counts — `PQ M=1103 T=1259 W=1305 …` plus `avg … /day = … pallet-weeks` — under the storage line on
+the billing preview, the saved run and the **retained invoice** (`/c/<slug>/invoice/<id>`), and
+`billing_line.source_refs` now stores the per-day figures rather than a bare list of dates.
+
+Both come off `billing.daily_pallets()`, deliberately the single implementation: a second one that
+drifted would be worse than showing nothing, and the tests assert the breakdown reconciles exactly
+to the quantity billed. It re-derives from `stock_on_hand` rather than parsing `source_refs`, which
+is safe because only *today's* snapshot rows are ever rewritten, and means it also works for an
+invoice raised by hand in NetSuite (no billing run behind it) once a period is assigned. A week the
+sync only partly covered says so on the line — the average is over the days that exist.
+
+### Storage report (`/c/<slug>/storage_report`, added 2026-08-28)
+The page behind the pallet figure — `service.storage_report()`, view key `storage_report`.
+A week selector (the same Mon–Sun snapping as billing, so it can't show a period billing could
+never produce), then: KPI tiles (avg pallets/day = what storage bills, peak/low day, units
+in/out, storage $), a **12-week trend** of the weekly average, a **daily chart** for the selected
+week with three series (pallets / units on hand / movement in-out), a day-by-day table and a
+per-SKU pallets-per-day table.
+
+- **Internal by default, grantable per user.** It's in `VIEW_KEYS` but not `CUSTOMER_VIEWS`.
+  Unlike `billing` it is *not* stripped in `perms.normalize_allowed()`, because it exposes
+  nothing a customer shouldn't see — it explains their own charge. Tick it in `/admin/users`.
+- **A day with no snapshot is a gap, not a zero.** Storage averages over the days *present*, so
+  a zero would both misdraw the chart and contradict the bill. Missing days stay in the series
+  (`missing: True`), draw as a dashed stub and dim their table row.
+- **No per-day dollar figure**, deliberately: storage is priced on the week's average, so a
+  daily $ would appear on no invoice.
+- **One query spans the trend.** Both charts are sliced out of a single `daily_pallets()` call
+  over the 12-week window rather than 12 calls — this is otherwise the most expensive page in
+  the app, and the droplet pays a round trip per query.
+- `chartTab()` is now **scoped to its `.card`** and remembers per chart (`data-chart` = storage
+  key, `data-default` = fallback series). It used to query the whole document and remember one
+  global key, which broke the moment a second chart shared a page.
+
 ## Build (the real app, in `app/`)
 FastAPI + SQLAlchemy, `DATABASE_URL` (SQLite local / Postgres droplet). `app/main.py` (auth, customer
-switcher, 6 views, billing run, admin console, token `/admin/ingest` + `/admin/billing/*`), `models.py`,
+switcher, 6 visibility views + storage report, billing run, admin console, token
+`/admin/ingest` + `/admin/billing/*`), `models.py`,
 `service.py` (read views), `billing.py` (the 5 charges), `netsuite.py` (ingest_* upserts; app never calls NS),
 `perms.py` (roles + view permissions), `security.py` (pbkdf2 + signed cookie), `seed.py`.
 Deploy pattern = vendor-credit-claims app (Docker on n8n droplet, weekly n8n sync job).

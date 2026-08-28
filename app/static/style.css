@@ -185,6 +185,23 @@ main{display:flex;flex-direction:column;min-width:0}
 /* Forecast bars are projections, not actuals — flatter fill + dashed cap so they never
    read as booked figures. .cur here means "this week" rather than "latest actual". */
 .bars.forecast .fill{background:var(--bar-soft);border-top:2px dashed var(--bar)}
+
+/* storage report ---------------------------------------------------------------
+   A day the SOH sync never covered is UNKNOWN, not zero: it draws as a dashed stub so it
+   can't be read as an empty warehouse, which is exactly the misreading that matters here
+   (storage averages over the days present, so a gap does not pull the average down). */
+.bar.gap .fill{background:transparent;border:1px dashed var(--line);min-height:12px}
+.bar.gap .vl{color:var(--faint)}
+/* Movement is two values per day. They sit side by side rather than stacked so "in" and
+   "out" stay comparable at a glance; received is solid, dispatched outlined. */
+.bar.twin{justify-content:flex-end}
+.bar.twin .pair{display:flex;align-items:flex-end;gap:2px;width:100%;max-width:34px;height:100%}
+.bar.twin .fill{max-width:none;flex:1;min-height:2px}
+.bar.twin .fin{background:var(--bar)}
+.bar.twin .fout{background:transparent;box-shadow:inset 0 0 0 1.5px var(--bar-cur)}
+/* A no-snapshot row in the day table is dimmed, not hidden — the week has 7 days whether or
+   not the sync covered them, and hiding the row would hide the gap. */
+tbody tr.rowgap td{background:var(--surface-2);color:var(--muted)}
 .bars.forecast .bar.cur .fill{background:var(--bar)}
 .chartnote{display:none;font-size:11.5px;color:var(--muted);padding:2px 16px 12px;font-style:italic}
 .chartnote.is-on{display:block}
@@ -316,6 +333,18 @@ tfoot td{padding:12px 16px;font-weight:650;border-top:2px solid var(--line);back
 .neg{color:var(--crit)}
 .btn.mini{width:auto;padding:6px 12px;font-size:12.5px;background:var(--brand-strong);color:var(--on-brand);border:0}
 .btn.mini:hover{filter:brightness(.92)}
+
+/* day-by-day pallet counts under a storage charge line (macro palletdays). Storage bills an
+   average, so this is the working behind the quantity. tbody td is nowrap for the tabular
+   views, which would push a 7-day breakdown off the card — normal here, and it sits under the
+   description rather than beside it so the table's own columns don't move. */
+.pqdays{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 9px;margin-top:6px;white-space:normal;font-weight:400}
+.pqlab{font-size:10.5px;font-weight:700;letter-spacing:.4px;color:var(--muted);border:1px solid var(--line);border-radius:5px;padding:1px 5px}
+.pqd{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.pqd b{color:var(--ink-2);font-weight:650}
+.pqsum{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;padding-left:5px;border-left:1px solid var(--line-2)}
+.pqsum b{color:var(--ink-2);font-weight:650}
+.pqwarn{flex-basis:100%;font-size:11.5px;color:var(--warn)}
 
 /* invoice drill-through */
 .invperiod{padding:14px 18px;margin:0 0 18px}

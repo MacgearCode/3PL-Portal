@@ -80,7 +80,8 @@ NAV = [
                     ("fulfilments", "Fulfilments", "out"),
                     ("invoices", "Invoices", "doc")]),
     ("Account", [("rate_card", "Rate card", "tag")]),
-    ("Macgear internal", [("billing", "Billing run", "calc")]),
+    ("Macgear internal", [("storage_report", "Storage report", "chart"),
+                          ("billing", "Billing run", "calc")]),
 ]
 TITLES = {
     "overview": ("Overview", "Live snapshot of your stock and charges"),
@@ -90,6 +91,8 @@ TITLES = {
     "fulfilments": ("Fulfilments", "Outbound dispatches — sales orders and VRMA transfers"),
     "invoices": ("Invoices", "3PL service charges billed to your account"),
     "rate_card": ("Rate card", "Agreed 3PL handling and storage rates"),
+    "storage_report": ("Storage report",
+                       "Pallets held per day — the working behind the storage charge"),
     "billing": ("Weekly billing run", "Automated charge calculation from NetSuite — Macgear internal"),
 }
 VALID_VIEWS = {k for _, items in NAV for k, *_ in items}
@@ -103,6 +106,7 @@ ICONS = {
     "doc": '<path d="M6 3h8l4 4v14H6z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M14 3v4h4M9 13h6M9 17h6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
     "tag": '<path d="M4 4h7l9 9-7 7-9-9z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><circle cx="8" cy="8" r="1.4" fill="currentColor"/>',
     "calc": '<rect x="5" y="3" width="14" height="18" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M8 7h8M8 11h2M12 11h4M8 15h2M8 18h2M14 14v4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>',
+    "chart": '<path d="M4 20V4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M4 20h16" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M8 20v-6M12 20v-10M16 20v-4M20 20v-8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>',
 }
 templates.env.globals.update(NAV=NAV, ICONS=ICONS, VIEW_LABELS=VIEW_LABELS, ROLES=perms.ROLES)
 
@@ -589,6 +593,20 @@ def portal(slug: str, view: str, request: Request, db: Session = Depends(get_db)
         ctx["soh_synced_at"] = service.soh_synced_at(db, cust.id)
     elif view == "rate_card":
         ctx["rows"] = service.rate_card_lines(db, cust.id)
+    elif view == "storage_report":
+        # Same week selector as billing, and deliberately the same snapping rule: the report
+        # exists to explain a billed week, so it must not be able to show a period billing
+        # could never produce. Unlike billing there is nothing to reject — a bad ?week= just
+        # falls back to the current week with the message.
+        ps_d, pe_d, period_err = _billing_period(request.query_params, (wk_start, wk_end))
+        ctx.update(
+            data=service.storage_report(db, cust.id, ps_d, pe_d, imap,
+                                        service.item_names(db, cust.id)),
+            period_start=ps_d.isoformat(), period_end=pe_d.isoformat(),
+            period_label=f"{ps_d.strftime('%a %d %b')} – {pe_d.strftime('%a %d %b %Y')}",
+            prev_week=(ps_d - timedelta(days=7)).isoformat(),
+            next_week=(ps_d + timedelta(days=7)).isoformat(),
+            period_err=period_err)
     elif view == "billing":
         ps_d, pe_d, period_err = _billing_period(request.query_params, (wk_start, wk_end))
         ps, pe = ps_d.isoformat(), pe_d.isoformat()
@@ -600,6 +618,10 @@ def portal(slug: str, view: str, request: Request, db: Session = Depends(get_db)
                    prev_week=(ps_d - timedelta(days=7)).isoformat(),
                    next_week=(ps_d + timedelta(days=7)).isoformat(),
                    msg=request.query_params.get("msg", ""))
+        # Day-by-day pallet counts behind the storage line. Storage is the only charge whose
+        # quantity is an average rather than a count of documents, so it's the only one that
+        # can't be traced from the invoice alone a month later.
+        ctx["storage_days"] = service.storage_breakdown(db, cust.id, ps_d, pe_d)
         runs = db.scalars(
             select(BillingRun).where(BillingRun.customer_id == cust.id)
             .order_by(BillingRun.created_at.desc())).all()
@@ -649,10 +671,15 @@ def invoice_detail(slug: str, invoice_id: int, request: Request, db: Session = D
     ctx = _portal_ctx(request, db, cust, "invoices")
     ctx.pop("_imap"); ctx.pop("_wk")
     period, source, run_period = service.invoice_period(db, inv)
+    # The storage line bills an average, so without the day-by-day counts the invoice can't be
+    # explained to a customer who queries it. Needs a period: an invoice with none (raised by
+    # hand in NetSuite, no period assigned yet) shows nothing rather than a guessed week.
+    breakdown = service.storage_breakdown(db, cust.id, *period) if period else None
     ctx.update(title=f"Invoice {inv.tranid or inv.ns_invoice_id}",
                sub="3PL service charges — line detail",
                invoice=inv, lines=lines, invoice_period=period,
                period_source=source, run_period=run_period,
+               storage_days=breakdown,
                msg=request.query_params.get("msg", ""))
     return templates.TemplateResponse(request, "portal.html", ctx)
 

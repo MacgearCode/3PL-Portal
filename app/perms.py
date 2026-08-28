@@ -12,8 +12,10 @@ import json
 
 # All view keys (must match main.NAV / TITLES).
 VIEW_KEYS = ["overview", "stock_on_order", "item_receipts", "stock_on_hand",
-             "fulfilments", "invoices", "rate_card", "billing"]
-# Customers never see the billing run (Macgear-internal).
+             "fulfilments", "invoices", "rate_card", "storage_report", "billing"]
+# Customers never see the billing run (Macgear-internal). `storage_report` is internal by
+# DEFAULT but not forbidden — unlike billing it exposes nothing a customer shouldn't see (it
+# explains their own storage charge), so it can be granted per user in /admin/users.
 CUSTOMER_VIEWS = ["overview", "stock_on_order", "item_receipts", "stock_on_hand",
                   "fulfilments", "invoices", "rate_card"]
 ROLE_DEFAULT_VIEWS = {"admin": VIEW_KEYS, "internal": VIEW_KEYS, "customer": CUSTOMER_VIEWS}
