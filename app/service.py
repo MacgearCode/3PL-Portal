@@ -133,6 +133,11 @@ def stock_on_order(db: Session, customer_id: int, imap: dict,
     shipments = {s.shipment_number: s for s in db.scalars(
         select(InboundShipment).where(InboundShipment.customer_id == customer_id)).all()
         if s.shipment_number}
+    # Pallets a row will occupy once received: ceil(outstanding / units per pallet), the same
+    # per-row ceil the storage charge uses. NULL units_per_pallet -> None, never 0, so an
+    # unknown pallet count is shown as unknown rather than quietly shrinking the total.
+    upp = {i.ns_item_id: i.units_per_pallet for i in db.scalars(
+        select(Item).where(Item.customer_id == customer_id)).all()}
     out = []
     for po in pos:
         for l in po.lines:
@@ -144,12 +149,15 @@ def stock_on_order(db: Session, customer_id: int, imap: dict,
             # else fall back to the PO line's own expected date.
             expected = (ship.expected_date if ship and ship.expected_date
                         else l.expected_date)
+            per = upp.get(l.ns_item_id)
             out.append({"tranid": po.tranid, "trandate": po.trandate, "status": po.status,
                         "sku": imap.get(l.ns_item_id, l.ns_item_id),
                         "name": names.get(l.ns_item_id, ""),
                         "ordered": float(l.qty_ordered or 0),
                         "received": float(l.qty_received or 0),
                         "outstanding": outstanding, "expected": expected,
+                        "units_per_pallet": per,
+                        "pallets": float(math.ceil(outstanding / per)) if per else None,
                         "shipment": l.ns_inbound_shipment,
                         "container": ship.container_no if ship else None,
                         "shipment_status": ship.status if ship else None})
@@ -832,6 +840,11 @@ def overview(db: Session, customer: Customer, imap: dict) -> dict:
         "storage_per_week": sum(r["storage_per_week"] for r in soh),
         "units_on_order": sum(r["outstanding"] for r in soo),
         "open_pos": len({r["tranid"] for r in soo}),
+        "pallets_inbound": sum(r["pallets"] for r in soo if r["pallets"] is not None),
+        # outstanding units whose SKU has no pallet quantity — excluded from pallets_inbound,
+        # and said so on the card rather than silently under-counting
+        "inbound_no_pallet_units": sum(r["outstanding"] for r in soo if r["pallets"] is None),
+        "inbound_no_pallet_skus": len({r["sku"] for r in soo if r["pallets"] is None}),
         "week_start": wk_start, "week_end": wk_end,
         "week_total": cur.total,
         "week_lines": [{"type": ct, "label": (by_type[ct].label if ct in by_type else lbl),

@@ -20,7 +20,9 @@
 {# Toolbar for the paged views. Window + search are GET params handled server-side, so the
    search covers ALL history (not just what's rendered) and the CSV exports the whole current
    selection. Both are plain forms/links — they work with JS disabled. #}
-{# `one` is the singular noun; plural is one + 's', which suits all three views. #}
+{# `one` is the singular noun; plural is one + 's', which suits all three views.
+   The export href must be ABSOLUTE: a relative `export.csv` from /c/<slug>/<view> resolves to
+   /c/<slug>/export.csv, which the view route reads as an unknown view and bounces to home. #}
 {% macro pagedtools(one) %}
 {% set noun = one if total == 1 else one ~ 's' %}
 <div class="ttools">
@@ -36,7 +38,7 @@
        class="{{ 'on' if window == key }}">{{ label }}</a>
     {% endfor %}
   </div>
-  <a class="btn-export" href="export.csv?window={{ window }}{% if q %}&q={{ q|urlencode }}{% endif %}"
+  <a class="btn-export" href="/c/{{ customer.slug }}/{{ view }}/export.csv?window={{ window }}{% if q %}&q={{ q|urlencode }}{% endif %}"
      title="Download the whole current selection ({{ total }} rows), not just what's on screen">
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v2a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
     Export CSV
@@ -154,11 +156,17 @@
     <div class="view">
     {% if view == "overview" %}
       {% set d = data %}
-      <div class="kpis">
+      <div class="kpis k5">
         <div class="kpi k-stock"><div class="rail"></div><div class="lab">Units on hand</div>
           <div class="val num">{{ d.units_on_hand|qty }}</div><div class="meta">{{ d.skus }} SKUs · {{ d.brand }}{% if d.soh_synced_at %} · <span class="live">● live</span> {{ d.soh_synced_at|ago }}{% endif %}</div></div>
         <div class="kpi k-pallet"><div class="rail"></div><div class="lab">Pallets stored</div>
           <div class="val num">{{ d.pallets|qty }}</div><div class="meta">→ <b>${{ d.storage_per_week|money }}</b>/wk storage</div></div>
+        {# Pallets the open PO lines will occupy on arrival (per-row ceil, same rule as storage).
+           Units whose SKU has no pallet qty can't be counted, so they're named, not dropped. #}
+        <div class="kpi k-inbound"><div class="rail"></div><div class="lab">Pallets inbound</div>
+          <div class="val num">{{ d.pallets_inbound|qty }}</div>
+          <div class="meta">{% if d.inbound_no_pallet_units %}<span class="chip c-crit" title="No units-per-pallet on the item in NetSuite">excl. {{ d.inbound_no_pallet_units|qty }} units · {{ d.inbound_no_pallet_skus }} SKU{{ 's' if d.inbound_no_pallet_skus != 1 }} no pallet qty</span>
+            {% else %}on open POs, once received{% endif %}</div></div>
         <div class="kpi k-order"><div class="rail"></div><div class="lab">Units on order</div>
           <div class="val num">{{ d.units_on_order|qty }}</div><div class="meta">{{ d.open_pos }} open PO{{ 's' if d.open_pos != 1 }} inbound</div></div>
         <div class="kpi k-bill"><div class="rail"></div><div class="lab">Charges this week</div>
@@ -245,14 +253,15 @@
       <div class="card"><header><h3>Open purchase orders</h3><span class="hint">keyed at $0 — customer retains ownership</span></header>
         {{ tabletools('tbl-soo', customer.slug ~ '-stock-on-order') }}
         <div class="tablewrap"><table id="tbl-soo">
-          <thead><tr><th>PO</th><th>SKU</th><th>Description</th><th>Inbound shipment</th><th>Container</th><th class="r">Ordered</th><th class="r">Received</th><th class="r">Outstanding</th><th>Expected receipt</th><th>Status</th></tr></thead>
+          <thead><tr><th>PO</th><th>SKU</th><th>Description</th><th>Inbound shipment</th><th>Container</th><th class="r">Ordered</th><th class="r">Received</th><th class="r">Outstanding</th><th class="r">Pallets</th><th>Expected receipt</th><th>Status</th></tr></thead>
           <tbody>{% for r in rows %}<tr><td><span class="id">{{ r.tranid }}</span></td><td><span class="id">{{ r.sku }}</span></td><td class="prim">{{ r.name }}</td>
             <td>{% if r.shipment %}<span class="id">{{ r.shipment }}</span>{% if r.shipment_status %} <span class="chip {{ r.shipment_status|chip }}">{{ r.shipment_status }}</span>{% endif %}{% else %}<span class="muted2">—</span>{% endif %}</td>
             <td><span class="id">{{ r.container or '—' }}</span></td>
             <td class="r num">{{ r.ordered|qty }}</td><td class="r num">{{ r.received|qty }}</td><td class="r num">{{ r.outstanding|qty }}</td>
+            <td class="r num">{% if r.pallets is not none %}{{ r.pallets|qty }}{% else %}<span class="chip c-crit" title="No units-per-pallet on this item in NetSuite">no pallet qty</span>{% endif %}</td>
             <td>{{ r.expected|dshort }}</td><td><span class="chip {{ r.status|chip }}">{{ r.status }}</span></td></tr>
-          {% else %}<tr><td class="empty" colspan="10">No open purchase orders.</td></tr>{% endfor %}</tbody>
-          {% if rows %}<tfoot><tr><td colspan="7">{{ rows|map(attribute='tranid')|unique|list|length }} open</td><td class="r">{{ tot_out|qty }}</td><td colspan="2"></td></tr></tfoot>{% endif %}
+          {% else %}<tr><td class="empty" colspan="11">No open purchase orders.</td></tr>{% endfor %}</tbody>
+          {% if rows %}<tfoot><tr><td colspan="7">{{ rows|map(attribute='tranid')|unique|list|length }} open</td><td class="r">{{ tot_out|qty }}</td><td class="r">{{ rows|rejectattr('pallets', 'none')|sum(attribute='pallets')|qty }}</td><td colspan="2"></td></tr></tfoot>{% endif %}
         </table></div>
       </div>
 
@@ -314,7 +323,9 @@
           {% elif period_source == 'run' %}<span class="sub2">from billing run</span>
           {% elif period_source == 'memo' %}<span class="sub2">from NetSuite memo</span>{% endif %}</div>
         <div><span class="lab">Status</span><span class="chip {{ invoice.status|chip }}">{{ invoice.status }}</span></div>
-        <div><span class="lab">Total (ex GST)</span><b class="num">${{ invoice.total|money }}</b></div>
+        {# invoice.total is NetSuite's foreigntotal, which INCLUDES GST. The lines below are
+           netamount (ex GST), hence the two totals legitimately differ. #}
+        <div><span class="lab">Total (inc GST)</span><b class="num">${{ invoice.total|money }}</b></div>
       </div>
       {# A hand-assigned period that disagrees with the run that created the invoice is
          surfaced, never silently applied — one of the two is wrong. #}
