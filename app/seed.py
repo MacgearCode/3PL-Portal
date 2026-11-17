@@ -143,6 +143,9 @@ def _seed_mova_demo(db, mova):
                 db.add(StockOnHand(
                     customer_id=mova.id, snapshot_date=snap_date, ns_item_id=ns_item,
                     qty_on_hand=oh, units_per_pallet=upp[ns_item],
+                    # demo Online (committed) split on the live snapshot only
+                    qty_committed=({"90001": 1200, "90002": 0}[ns_item]
+                                   if snap_date == today else None),
                     pallets=math.ceil(oh / upp[ns_item])))
 
     # Fulfilments (picking) — SO dispatches plus one VRMA buy-in.

@@ -263,7 +263,13 @@ def stock_on_hand(db: Session, customer_id: int, imap: dict,
     """Latest snapshot per item, with storage/week derived from the rate card.
     The snapshot is refreshed in place every ~15 min, so rows carry synced_at
     (use soh_synced_at() for the single "live as at" time shown in the portal).
-    Items currently at zero on hand are dropped from the view."""
+    Items currently at zero on hand are dropped from the view.
+
+    On hand is split into qty_online (committed to open sales orders = held for the customer's
+    online channel) and qty_3pl (the remainder); the two always sum to qty_on_hand. Committed is
+    capped at on hand - a negative 3PL figure would be nonsense. Both are None when the feed
+    carried no committed figure (pre-2026-11-17 snapshot), so the page shows a dash rather than
+    claiming 0 online."""
     rate = storage_rate(db, customer_id)
     names = names or {}
     latest = db.scalar(
@@ -284,10 +290,20 @@ def stock_on_hand(db: Session, customer_id: int, imap: dict,
         out.append({"sku": imap.get(s.ns_item_id, s.ns_item_id),
                     "name": names.get(s.ns_item_id, ""),
                     "qty_on_hand": float(s.qty_on_hand),
+                    **_online_split(s.qty_on_hand, s.qty_committed),
                     "units_per_pallet": s.units_per_pallet, "pallets": pallets,
                     "storage_per_week": round(pallets * rate, 2),
                     "snapshot_date": s.snapshot_date, "synced_at": s.synced_at})
     return out
+
+
+def _online_split(on_hand, committed) -> dict:
+    """Online (committed) vs 3PL (the rest) for one SOH row; see stock_on_hand()."""
+    if committed is None:
+        return {"qty_online": None, "qty_3pl": None}
+    oh = float(on_hand or 0)
+    online = min(max(float(committed), 0.0), oh) if oh > 0 else 0.0
+    return {"qty_online": online, "qty_3pl": oh - online}
 
 
 def soh_synced_at(db: Session, customer_id: int):

@@ -122,6 +122,7 @@ CREATE TABLE stock_on_hand (
     snapshot_date       DATE NOT NULL,
     ns_item_id          TEXT NOT NULL,
     qty_on_hand         NUMERIC(14,2) NOT NULL,
+    qty_committed       NUMERIC(14,2),                  -- of qty_on_hand, committed to open SOs (= Online); NULL = not in feed
     units_per_pallet    INTEGER,                        -- snapshotted so historic pallet calc is stable
     pallets             NUMERIC(14,2),                  -- ceil(qty_on_hand / units_per_pallet), computed at sync
     synced_at           TIMESTAMP,                      -- when this row was last written by a sync

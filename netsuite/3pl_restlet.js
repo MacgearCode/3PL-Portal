@@ -290,7 +290,32 @@ define(['N/query', 'N/record'], function (query, record) {
       "SELECT ib.item, SUM(ib.quantityonhand) qty FROM inventorybalance ib " +
       "JOIN item i ON i.id=ib.item WHERE i.class=" + Number(p.ns_class_id) +
       locClause(p, 'ib') + " GROUP BY ib.item");
-    return flat.map(function (r) { return { ns_item_id: String(r.item), qty_on_hand: r.qty }; });
+
+    // Committed qty (2026-11-17) — stock committed to open sales orders at the location, which the
+    // portal shows as the customer's ONLINE stock (the rest of on-hand = 3PL stock). Read from
+    // inventoryitemlocations (one row per item+location, so nothing to de-duplicate) rather than
+    // inventorybalance, whose committedqtyperlocation repeats on every bin/status row and would
+    // multiply if summed. Separate and try/catch'd: it is a display column, and must never be able
+    // to fail the on-hand read that storage billing depends on. On failure the key is omitted and
+    // the app stores NULL ("not known"), never 0.
+    var committed = null;
+    try {
+      committed = {};
+      runSuiteQL(
+        "SELECT iil.item, SUM(iil.quantitycommitted) qty FROM inventoryitemlocations iil " +
+        "JOIN item i ON i.id=iil.item WHERE i.class=" + Number(p.ns_class_id) +
+        locClause(p, 'iil') + " GROUP BY iil.item"
+      ).forEach(function (r) { committed[String(r.item)] = Number(r.qty) || 0; });
+    } catch (e) {
+      log.error('stockOnHand committed lookup', e);
+      committed = null;
+    }
+
+    return flat.map(function (r) {
+      var row = { ns_item_id: String(r.item), qty_on_hand: r.qty };
+      if (committed) row.qty_committed = committed[String(r.item)] || 0;
+      return row;
+    });
   }
 
   // item master for the customer's brand (class) — itemid = SKU shown in the portal; the portal

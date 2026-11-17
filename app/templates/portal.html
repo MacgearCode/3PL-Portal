@@ -282,12 +282,18 @@
       <div class="card"><header><h3>Stock on hand</h3><span class="hint">{{ customer.location_label }}{% if soh_synced_at %} · <span class="live">● live</span> · updated {{ soh_synced_at|ago }}{% endif %}</span></header>
         {{ tabletools('tbl-soh', customer.slug ~ '-stock-on-hand') }}
         <div class="tablewrap"><table id="tbl-soh">
-          <thead><tr><th>SKU</th><th>Description</th><th class="r">On hand</th><th class="r">Units / pallet</th><th class="r">Pallets</th><th class="r">Storage / wk</th></tr></thead>
+          {# Online = committed to open sales orders (held for the customer's online channel);
+             3PL = the rest. Online + 3PL = Total on hand. A dash = no committed figure in the feed. #}
+          <thead><tr><th>SKU</th><th>Description</th><th class="r" title="Committed to open sales orders - held for your online channel">Online</th><th class="r" title="On hand and not committed">3PL</th><th class="r">Total on hand</th><th class="r">Units / pallet</th><th class="r">Pallets</th><th class="r">Storage / wk</th></tr></thead>
           <tbody>{% for r in rows %}<tr><td><span class="id">{{ r.sku }}</span></td><td class="prim">{{ r.name }}</td>
-            <td class="r num">{{ r.qty_on_hand|qty }}</td><td class="r num">{{ r.units_per_pallet }}</td><td class="r num">{{ r.pallets|qty }}</td>
+            <td class="r num">{{ r.qty_online|qty if r.qty_online is not none else '—' }}</td><td class="r num">{{ r.qty_3pl|qty if r.qty_3pl is not none else '—' }}</td>
+            <td class="r num"><b>{{ r.qty_on_hand|qty }}</b></td><td class="r num">{{ r.units_per_pallet }}</td><td class="r num">{{ r.pallets|qty }}</td>
             <td class="r num">${{ r.storage_per_week|money }}</td></tr>
-          {% else %}<tr><td class="empty" colspan="6">No stock on hand.</td></tr>{% endfor %}</tbody>
-          {% if rows %}<tfoot><tr><td colspan="2">{{ rows|length }} SKUs</td><td class="r">{{ rows|sum(attribute='qty_on_hand')|qty }}</td><td></td>
+          {% else %}<tr><td class="empty" colspan="8">No stock on hand.</td></tr>{% endfor %}</tbody>
+          {% if rows %}{% set known = rows|rejectattr('qty_online', 'none')|list %}
+            <tfoot><tr><td colspan="2">{{ rows|length }} SKUs</td>
+            <td class="r">{{ known|sum(attribute='qty_online')|qty if known else '—' }}</td><td class="r">{{ known|sum(attribute='qty_3pl')|qty if known else '—' }}</td>
+            <td class="r">{{ rows|sum(attribute='qty_on_hand')|qty }}</td><td></td>
             <td class="r">{{ rows|sum(attribute='pallets')|qty }}</td><td class="r">${{ rows|sum(attribute='storage_per_week')|money }}</td></tr></tfoot>{% endif %}
         </table></div>
       </div>

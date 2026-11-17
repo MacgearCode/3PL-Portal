@@ -347,7 +347,10 @@ def ingest_inbound_shipments(db: Session, c: Customer, rows: list[dict]) -> int:
 def ingest_stock_on_hand(db: Session, c: Customer, rows: list[dict]) -> int:
     """A full current-state snapshot for today, written in place each ~15-min sync.
 
-    rows: [{ns_item_id, qty_on_hand, units_per_pallet?}]. NetSuite's inventorybalance returns
+    rows: [{ns_item_id, qty_on_hand, qty_committed?, units_per_pallet?}]. qty_committed is the
+    part of on-hand committed to open sales orders (the customer's Online stock); it is summed
+    like qty_on_hand, so the RESTlet must send it ONCE per item/location, not repeated on every
+    bin/status row. A feed without the key leaves it NULL ("not known"), never 0. NetSuite's inventorybalance returns
     MULTIPLE rows per item (per status/bin, incl. +/- pairs), so first aggregate to one net qty
     per item — that keeps the (customer, today, item) snapshot key unique and yields the true
     on-hand. Pallets = ceil(qty/units_per_pallet); units_per_pallet falls back to the Item record.
@@ -366,8 +369,10 @@ def ingest_stock_on_hand(db: Session, c: Customer, rows: list[dict]) -> int:
     agg: dict[str, dict] = {}
     for r in rows:
         ns_item = str(r["ns_item_id"])
-        a = agg.setdefault(ns_item, {"qty": 0.0, "per": None})
+        a = agg.setdefault(ns_item, {"qty": 0.0, "committed": None, "per": None})
         a["qty"] += _num(r.get("qty_on_hand")) or 0
+        if "qty_committed" in r:
+            a["committed"] = (a["committed"] or 0) + (_num(r.get("qty_committed")) or 0)
         if a["per"] is None and r.get("units_per_pallet"):
             a["per"] = r.get("units_per_pallet")
 
@@ -384,16 +389,19 @@ def ingest_stock_on_hand(db: Session, c: Customer, rows: list[dict]) -> int:
         existing = existing_today.get(ns_item)
         if existing:
             existing.qty_on_hand, existing.units_per_pallet = qty, per
+            existing.qty_committed = a["committed"]
             existing.pallets, existing.synced_at = pallets, now
         else:
             db.add(StockOnHand(customer_id=c.id, snapshot_date=today, ns_item_id=ns_item,
-                               qty_on_hand=qty, units_per_pallet=per, pallets=pallets,
-                               synced_at=now))
+                               qty_on_hand=qty, qty_committed=a["committed"],
+                               units_per_pallet=per, pallets=pallets, synced_at=now))
 
     # Zero today's rows for items no longer reported on hand (replace semantics).
     for ns_item, s in existing_today.items():
         if ns_item not in agg and float(s.qty_on_hand or 0) != 0:
             s.qty_on_hand = 0
+            if s.qty_committed is not None:
+                s.qty_committed = 0
             s.pallets = 0 if s.units_per_pallet else None
             s.synced_at = now
     return len(agg)

@@ -216,6 +216,30 @@ per-SKU pallets-per-day table.
   key, `data-default` = fallback series). It used to query the whole document and remember one
   global key, which broke the moment a second chart shared a page.
 
+## Stock on hand: Online / 3PL split (built 2026-11-17, RESTlet NOT yet redeployed)
+Mova wants on-hand split into **Online** = qty **committed** to open sales orders at the 3PL
+location (they hold online-channel stock by raising an SO, e.g. `SO475896`; the SO itself isn't
+shown) and **3PL** = the remainder, plus **Total on hand**. `stock_on_hand.qty_committed`
+(nullable, `ensure_columns()`), `service._online_split()` (Online capped at on hand, so
+Online + 3PL = Total always). **NULL = the feed carried no committed figure → shown as "—", never 0.**
+Display only: storage still bills on the full on-hand, as committed stock is still on a pallet.
+RESTlet `stockOnHand` reads `inventoryitemlocations.quantitycommitted` (one row per item+location;
+`inventorybalance.committedqtyperlocation` repeats per bin/status and would multiply if summed)
+in a **separate try/catch'd query** so it can never fail the on-hand read billing depends on.
+**Verified against production 2026-11-17** (via MCP, not yet via the RESTlet's own role): the
+query returns **5,825 committed** across 23 SKUs, matching SO475896's `quantitycommitted` line for
+line; `inventoryitemlocations.quantityonhand` equals the existing `inventorybalance` on-hand for all
+45 SKUs (35,459 total → 3PL 29,634). `quantitycommitted` is **NULL, not 0**, where nothing is
+committed (the RESTlet coalesces). `SUM(inventorybalance.committedqtyperlocation)` would have
+read 912,285 for one SKU that has 485 committed, because many SKUs carry one balance row per serial unit.
+SO475896 is on customer **`02176 Holding Orders`**, not a Mova record. One line
+(`010910AA000005`) orders 170 but commits only the 144 on hand (26 backordered), so that SKU
+shows 144 Online / 0 3PL. Backorders never count as Online.
+If Online shows "—" after the redeploy, the integration role can't read `inventoryitemlocations`
+(see the RESTlet execution log). ⚠️ Online = **any** SO committed at loc 49: if a $0 dispatch SO is raised
+on the customer account and sits unfulfilled, it shows as Online too. If that becomes a real
+problem, narrow it to SOs on `02176 Holding Orders` via `transactionline`, not `inventoryitemlocations`.
+
 ## Build (the real app, in `app/`)
 FastAPI + SQLAlchemy, `DATABASE_URL` (SQLite local / Postgres droplet). `app/main.py` (auth, customer
 switcher, 6 visibility views + storage report, billing run, admin console, token

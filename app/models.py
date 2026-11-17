@@ -207,6 +207,11 @@ class StockOnHand(Base):
     snapshot_date: Mapped[date] = mapped_column(Date)
     ns_item_id: Mapped[str] = mapped_column(String)
     qty_on_hand: Mapped[float] = mapped_column(Numeric(14, 2))
+    # Of qty_on_hand, how much is committed to open sales orders at the location - shown to the
+    # customer as stock held for their ONLINE channel (the rest is plain 3PL stock). NULL = the
+    # feed didn't carry it (a RESTlet older than 2026-11-17), shown as a dash, never as 0.
+    # Display only: storage still bills on qty_on_hand, committed stock is physically stored.
+    qty_committed: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
     units_per_pallet: Mapped[int | None] = mapped_column(Integer, nullable=True)
     pallets: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
     # When this row was last written by a sync. Today's row is overwritten in place each

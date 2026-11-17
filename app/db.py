@@ -43,7 +43,9 @@ def ensure_columns():
     SQLite/Postgres db. Both engines accept `ALTER TABLE ... ADD COLUMN`; we only add when
     absent. Lives here (not main.py) so `python -m app.seed` runs it BEFORE any query — the
     seed starts before the app imports, so migrating in main.py alone would crash the seed."""
-    additions = {"stock_on_hand": {"synced_at": "TIMESTAMP"},
+    additions = {"stock_on_hand": {"synced_at": "TIMESTAMP",
+                                   # Committed (Online) split on the SOH view (2026-11-17).
+                                   "qty_committed": "NUMERIC(14,2)"},
                  "item_receipt": {"po_tranid": "VARCHAR"},
                  "po_line": {"ns_inbound_shipment": "VARCHAR"},
                  "inbound_shipment": {"expected_date": "DATE", "container_no": "VARCHAR"},
